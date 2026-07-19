@@ -1,0 +1,24 @@
+[Unit]
+Description=Multi-tenant ELD-to-Asana control bot (Telegram onboarding/rotation/status)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/eld-asana/app
+# Run as a module so control_bot's own package-relative imports
+# (control_bot.config_store, etc. - see control_bot/main.py) resolve
+# correctly regardless of CWD quirks.
+ExecStart=/opt/eld-asana/venv/bin/python -m control_bot.main
+Restart=on-failure
+RestartSec=15
+User=eldcontrolbot
+Group=eldcontrolbot
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/eld-asana/control-bot /opt/eld-asana/teams
+
+[Install]
+WantedBy=multi-user.target

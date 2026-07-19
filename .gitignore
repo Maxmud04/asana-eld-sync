@@ -1,0 +1,18 @@
+# Secrets & credentials - never commit these (matches at any depth: root
+# .env, teams/*/.env, control_bot/.env)
+.env
+control_bot/master.key
+control_bot/config.db
+control_bot/config.db.bak*
+
+# Per-team runtime state - regenerated automatically by provisioning/sync,
+# not source code, and contains real customer/company data.
+teams/*/pending_companies.json
+teams/*/*.log
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.pyc

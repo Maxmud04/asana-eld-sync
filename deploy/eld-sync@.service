@@ -1,0 +1,28 @@
+[Unit]
+Description=ELD-to-Asana sync for team %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# CWD-per-instance is what gives each team real isolation for free:
+# sync.py's load_dotenv() reads ".env" from the CWD, and its logging
+# FileHandler writes "sync.log" relative to the CWD - both become
+# per-team-scoped just by running from a per-team directory, with zero
+# code changes to sync.py itself. See /opt/eld-asana/teams/<team_id>/.
+WorkingDirectory=/opt/eld-asana/teams/%i
+ExecStart=/opt/eld-asana/venv/bin/python /opt/eld-asana/app/sync.py
+Restart=on-failure
+RestartSec=15
+User=eldsync
+Group=eldsync
+
+# Defense in depth - this process only ever needs to read its own team
+# directory and make outbound HTTPS calls, nothing else on the box.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/eld-asana/teams/%i
+
+[Install]
+WantedBy=multi-user.target

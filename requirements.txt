@@ -1,0 +1,3 @@
+requests
+python-dotenv
+cryptography  # only used by control_bot/ (encrypts stored team tokens at rest)

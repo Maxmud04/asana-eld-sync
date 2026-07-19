@@ -1,0 +1,14 @@
+# Install with: sudo cp eldcontrolbot-sudoers /etc/sudoers.d/eld-control-bot
+#               sudo chmod 440 /etc/sudoers.d/eld-control-bot
+#
+# Lets the control-bot's own unprivileged service account (eldcontrolbot -
+# NOT root, see eld-control-bot.service's User=) start/stop/restart/enable/
+# disable per-team sync units, and nothing else on the box. supervisor.py
+# calls exactly these five verbs against exactly the eld-sync@* template -
+# keep this rule that narrow if it's ever edited.
+eldcontrolbot ALL=(root) NOPASSWD: /bin/systemctl start eld-sync@*, \
+    /bin/systemctl stop eld-sync@*, \
+    /bin/systemctl restart eld-sync@*, \
+    /bin/systemctl enable --now eld-sync@*, \
+    /bin/systemctl disable --now eld-sync@*, \
+    /bin/systemctl show eld-sync@*
