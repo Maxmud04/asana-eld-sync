@@ -10,13 +10,11 @@ team's chat_id gets the interactive commands (/status, /pause, /resume,
 /rotatefactor, /rotateleader, /rotateasana) applied to THEIR row only.
 """
 
-import os
 import re
 
 import asana_client
 import eld_factor
 import eld_leader
-import pending_companies
 from control_bot import validators
 from eld_common import invisibility_reason
 
@@ -48,12 +46,11 @@ def _clean_pasted_value(raw_text):
 
 
 class TeamRouter:
-    def __init__(self, gateway, config_store, onboarding, provisioning, supervisor, logger):
+    def __init__(self, gateway, config_store, onboarding, provisioning, logger):
         self.gateway = gateway
         self.config_store = config_store
         self.onboarding = onboarding
         self.provisioning = provisioning
-        self.supervisor = supervisor
         self.logger = logger
 
     def handle_update(self, update):
@@ -200,10 +197,10 @@ class TeamRouter:
             self.gateway.send_message(chat_id, "Checking now...")
             self.gateway.send_buttons(chat_id, self._truck_counts_text(team_id), [BACK_BUTTON])
         elif text == "/pause":
-            self.supervisor.pause_team(team_id)
+            self.config_store.update_team(team_id, status="paused")
             self.gateway.send_buttons(chat_id, "Sync paused. Send /resume to continue.", [BACK_BUTTON])
         elif text == "/resume":
-            self.supervisor.resume_team(team_id)
+            self.config_store.update_team(team_id, status="active")
             self.gateway.send_buttons(chat_id, "Sync resumed.", [BACK_BUTTON])
         elif text in _ROTATABLE_FIELDS:
             self._prompt_rotation(chat_id, team_id, text)
@@ -255,16 +252,16 @@ class TeamRouter:
         front, its actual options only appear once you tap in). Builds the
         board list fresh from this team's own stored Asana credentials
         rather than anything sync.py passed along, since by this point
-        sync.py's own alert is long done - only the pending_companies.json
-        entry and this callback_data survive between the two steps.
+        sync.py's own alert is long done - only the pending_companies
+        entry (see config_store.get_pending_company) and this
+        callback_data survive between the two steps.
         callback_data shape: "companyassign:<team_id>:<pending_id>"."""
         _, callback_team_id, pending_id = data.split(":", 2)
         if callback_team_id not in self.config_store.team_ids_for_chat(chat_id):
             self.gateway.send_message(chat_id, "This button isn't for your team - ignoring.")
             return
 
-        team_dir = os.path.join(self.supervisor.teams_root_dir, callback_team_id)
-        entry = pending_companies.get(team_dir, pending_id)
+        entry = self.config_store.get_pending_company(callback_team_id, pending_id)
         if entry is None:
             self.gateway.edit_message_text(
                 chat_id, message_id, "That company was already assigned (or is no longer pending).",
@@ -415,8 +412,7 @@ class TeamRouter:
             self.gateway.send_message(chat_id, "This button isn't for your team - ignoring.")
             return
 
-        team_dir = os.path.join(self.supervisor.teams_root_dir, callback_team_id)
-        entry = pending_companies.pop(team_dir, pending_id)
+        entry = self.config_store.pop_pending_company(callback_team_id, pending_id)
         if entry is None:
             self.gateway.edit_message_text(
                 chat_id, message_id, "That company was already assigned (or is no longer pending).",
@@ -436,19 +432,17 @@ class TeamRouter:
         )
 
     def _handle_skip_callback(self, chat_id, message_id, data):
-        """"Skip" was tapped - deliberately does NOT remove the entry from
-        pending_companies.json (unlike an actual board assignment), so
-        pending_companies.add_if_new's dedup check keeps treating this
-        company as already-seen and sync.py never re-alerts on it, even
-        though nothing was created for it. callback_data shape:
-        "skip:<team_id>:<pending_id>"."""
+        """"Skip" was tapped - deliberately does NOT remove the entry (unlike
+        an actual board assignment), so add_pending_company_if_new's dedup
+        check keeps treating this company as already-seen and sync.py never
+        re-alerts on it, even though nothing was created for it.
+        callback_data shape: "skip:<team_id>:<pending_id>"."""
         _, callback_team_id, pending_id = data.split(":", 2)
         if callback_team_id not in self.config_store.team_ids_for_chat(chat_id):
             self.gateway.send_message(chat_id, "This button isn't for your team - ignoring.")
             return
 
-        team_dir = os.path.join(self.supervisor.teams_root_dir, callback_team_id)
-        entry = pending_companies.get(team_dir, pending_id)
+        entry = self.config_store.get_pending_company(callback_team_id, pending_id)
         company_name = entry["company_name"] if entry else "that company"
         self.gateway.edit_message_text(
             chat_id, message_id, f"Skipped '{company_name}' - won't ask again.", buttons=[BACK_BUTTON],
@@ -456,9 +450,9 @@ class TeamRouter:
 
     def _send_status(self, chat_id, team_id):
         team = self.config_store.get_team(team_id)
-        status = self.supervisor.get_status(team_id)
+        state = "paused" if team["status"] == "paused" else "active"
         self.gateway.send_buttons(
-            chat_id, f"Team: {team['team_name']}\nProcess: {status}\nConfig status: {team['status']}",
+            chat_id, f"Team: {team['team_name']}\nSync: {state}",
             [BACK_BUTTON],
         )
 
@@ -519,7 +513,8 @@ class TeamRouter:
         self.config_store.update_team(team_id, **{field_name: new_value})
         self.config_store.clear_onboarding_session(chat_id)
         self.provisioning.rewrite_env(team_id)
-        self.supervisor.rotate_and_restart(team_id)
         self.gateway.send_buttons(
-            chat_id, f"{data['label']} token updated ({message}) - restarting sync now.", [BACK_BUTTON],
+            chat_id,
+            f"{data['label']} token updated ({message}) - takes effect on the next sync cycle.",
+            [BACK_BUTTON],
         )

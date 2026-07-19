@@ -2,9 +2,15 @@
 control_bot/provisioning.py
 
 Turns a completed onboarding conversation (see onboarding.py) into: real
-Asana boards created from scratch (asana_client.py's bootstrap_* methods),
-a saved team config row, a generated per-team .env file, and a running
-systemd unit for that team's own isolated sync.py process.
+Asana boards created from scratch (asana_client.py's bootstrap_* methods)
+and a saved team config row. A newly-provisioned team is picked up by
+multi_sync.py's shared per-team loop on its very next cycle (the loop
+queries config_store for every "active" team - see run_all_teams_once) -
+no process to spawn or systemd unit to start, unlike the old
+one-OS-process-per-team design. rewrite_env() still generates a
+teams/<team_id>/.env file too, purely as an optional convenience for
+anyone who wants to run that one team's sync.py standalone (e.g. local
+development) - the shared loop itself never reads it.
 """
 
 import logging
@@ -23,9 +29,8 @@ _ODOMETER_BOARD_SUFFIX = "Odometer Jump"
 
 
 class Provisioner:
-    def __init__(self, config_store, supervisor, teams_root_dir, shared_bot_token, logger=None):
+    def __init__(self, config_store, teams_root_dir, shared_bot_token, logger=None):
         self.config_store = config_store
-        self.supervisor = supervisor
         self.teams_root_dir = teams_root_dir
         self.shared_bot_token = shared_bot_token
         self.logger = logger or _logger
@@ -65,7 +70,6 @@ class Provisioner:
         )
 
         self.rewrite_env(team_id)
-        self.supervisor.enable_and_start(team_id)
 
     def _populate_staff_roster(self, client, dispatch_project_id, staff_roster):
         """Add each roster entry as a Staff ID option (and its matching

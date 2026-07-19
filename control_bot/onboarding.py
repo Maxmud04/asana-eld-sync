@@ -287,9 +287,10 @@ class OnboardingManager:
             self.config_store.add_team_admin(chat_id, team_id, sender_id)
             # provision_team() already wrote the .env before this admin's
             # chat_id was registered - rewrite it now so TEAM_CHAT_IDS
-            # actually includes them, then bounce the process to pick it up.
+            # actually includes them. No restart needed: multi_sync.py's
+            # shared loop queries config_store fresh every cycle and will
+            # pick this team up (status="active") on its very next pass.
             self.provisioning.rewrite_env(team_id)
-            self.provisioning.supervisor.rotate_and_restart(team_id)
         except Exception:
             self.logger.exception("Provisioning failed for team '%s'", team_id)
             self.gateway.send_message(

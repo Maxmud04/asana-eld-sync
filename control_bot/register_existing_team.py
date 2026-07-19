@@ -20,7 +20,6 @@ from dotenv import load_dotenv
 import eld_factor
 from control_bot.config_store import ConfigStore
 from control_bot.provisioning import Provisioner
-from control_bot.supervisor import Supervisor
 
 TEAM_ID = "original"
 TEAM_NAME = "Texas"
@@ -68,8 +67,7 @@ def main():
 
     teams_root_dir = os.path.join(_REPO_ROOT, "teams")
     shared_bot_token = os.environ["TELEGRAM_BOT_TOKEN"]
-    supervisor = Supervisor(teams_root_dir, logger)
-    provisioning = Provisioner(config_store, supervisor, teams_root_dir, shared_bot_token, logger)
+    provisioning = Provisioner(config_store, teams_root_dir, shared_bot_token, logger)
     provisioning.rewrite_env(TEAM_ID)
 
     logger.info(

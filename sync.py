@@ -36,7 +36,6 @@ from dotenv import load_dotenv
 import asana_client
 import eld_factor
 import eld_leader
-import pending_companies
 import telegram_control
 import telegram_notifier
 from asana_client import normalize_company_name, normalize_name, vehicle_field_value, word_sort_key
@@ -192,13 +191,29 @@ def _resolve_staff_for_combined_unit(unit, staff_editors_by_id, logger):
     return None, display_name
 
 
+class TokenAlertState:
+    """Per-team dedup state for the two proactive Telegram alerts below (a
+    dead-token failure, a token-expiring-soon warning) - see
+    _handle_factor_fetch_failure/_check_token_expiry_warning. Kept on this
+    small object, rather than module globals, so multi_sync.py's per-team
+    loop can give each team its own instance (a shared global would let one
+    team's dead Factor ELD token suppress another team's identical alert).
+    The single-team main() below never constructs one explicitly - every
+    function here defaults to _default_token_alert_state, preserving its
+    exact original single-team behavior."""
+
+    def __init__(self):
+        self.factor_token_alert_sent = False
+        self.last_warned_token_exp = {"FACTOR_SESSION_TOKEN": None, "LEADER_SESSION_TOKEN": None}
+
+
 # Tracks whether we've already sent a Telegram alert for the CURRENT Factor
 # ELD token outage, so a dead token doesn't spam a new message every single
 # cycle - just once when it first breaks, and the state resets the moment a
 # fetch succeeds again (see _handle_factor_fetch_failure / _mark_factor_
 # fetch_ok). Shared across run_one_cycle and run_database_cycle since both
 # can hit the exact same underlying dead-token problem.
-_factor_token_alert_sent = False
+_default_token_alert_state = TokenAlertState()
 
 
 def _is_factor_token_error(exc):
@@ -210,24 +225,23 @@ def _is_factor_token_error(exc):
     return "rejected the request as unauthorized" in str(exc)
 
 
-def _handle_factor_fetch_failure(exc, control):
+def _handle_factor_fetch_failure(exc, control, state=None):
     """Proactively alert via Telegram the first time a cycle fails because
     a Factor ELD/Leader ELD token is dead - the one failure mode that
     actually needs the user to do something. Does nothing for other kinds
     of failures (network hiccups, etc.), if no Telegram control is
     running, or if we've already alerted for this same ongoing outage."""
-    global _factor_token_alert_sent
-    if control is None or not _is_factor_token_error(exc) or _factor_token_alert_sent:
+    state = state or _default_token_alert_state
+    if control is None or not _is_factor_token_error(exc) or state.factor_token_alert_sent:
         return
     control.notify_all(
         f"⚠️ Sync is failing - {exc}\n\nSend a fresh token here (or /settoken) to resume syncing."
     )
-    _factor_token_alert_sent = True
+    state.factor_token_alert_sent = True
 
 
-def _mark_factor_fetch_ok():
-    global _factor_token_alert_sent
-    _factor_token_alert_sent = False
+def _mark_factor_fetch_ok(state=None):
+    (state or _default_token_alert_state).factor_token_alert_sent = False
 
 
 # How many days ahead of its own expiry to warn about a session token, so
@@ -238,14 +252,6 @@ def _mark_factor_fetch_ok():
 # Leader ELD's own login flow, not by anything here - this constant just
 # controls how early we nag about whatever expiry the token itself states.
 TOKEN_EXPIRY_WARNING_DAYS = 3
-
-# The exact expiry timestamp we've already warned about for each token, so
-# a token close to expiring only triggers one Telegram message (not one
-# every cycle) until it's actually replaced with a new one (which has a
-# different exp and so triggers its own fresh warning, once IT gets close).
-# Keyed by env var name so Factor's and Leader's dedup state never collide.
-_last_warned_token_exp = {"FACTOR_SESSION_TOKEN": None, "LEADER_SESSION_TOKEN": None}
-
 
 def _decode_token_expiry(token):
     """Return a session JWT's own 'exp' claim as a UTC datetime, or None if
@@ -264,16 +270,21 @@ def _decode_token_expiry(token):
         return None
 
 
-def _check_one_token_expiry(control, env_var_name, platform_label):
-    exp_dt = _decode_token_expiry(os.environ.get(env_var_name, ""))
+def _check_one_token_expiry(control, env_var_name, platform_label, token_value=None, state=None):
+    state = state or _default_token_alert_state
+    # Falls back to the process's own env var when no explicit token_value
+    # is given - preserves main()'s original single-team behavior exactly.
+    if token_value is None:
+        token_value = os.environ.get(env_var_name, "")
+    exp_dt = _decode_token_expiry(token_value)
     if exp_dt is None:
         return
 
     days_remaining = (exp_dt - datetime.now(timezone.utc)).total_seconds() / 86400
     if days_remaining > TOKEN_EXPIRY_WARNING_DAYS:
-        _last_warned_token_exp[env_var_name] = None  # fresh/renewed token - reset for next time
+        state.last_warned_token_exp[env_var_name] = None  # fresh/renewed token - reset for next time
         return
-    if _last_warned_token_exp[env_var_name] == exp_dt:
+    if state.last_warned_token_exp[env_var_name] == exp_dt:
         return  # already warned about this exact token
 
     control.notify_all(
@@ -282,57 +293,31 @@ def _check_one_token_expiry(control, env_var_name, platform_label):
         f"Renew it soon (log in to {platform_label}, grab the fresh access_token) "
         f"so syncing doesn't stop."
     )
-    _last_warned_token_exp[env_var_name] = exp_dt
+    state.last_warned_token_exp[env_var_name] = exp_dt
 
 
-def _check_token_expiry_warning(control):
+def _check_token_expiry_warning(control, factor_token=None, leader_token=None, state=None):
     """Proactively warn via Telegram once either Factor ELD's or Leader
     ELD's current token is within TOKEN_EXPIRY_WARNING_DAYS of its own
     stated expiry - lets you renew ahead of time instead of only finding
     out once a cycle actually fails (see _handle_factor_fetch_failure for
     that reactive case). Checks both platforms independently - a fresh
-    Factor token doesn't reset Leader's dedup state or vice versa."""
+    Factor token doesn't reset Leader's dedup state or vice versa.
+    factor_token/leader_token let a caller (multi_sync.py) pass a specific
+    team's own token explicitly instead of relying on process env vars -
+    the single-team main() below omits them, keeping its original
+    env-var-based behavior."""
     if control is None:
         return
-    _check_one_token_expiry(control, "FACTOR_SESSION_TOKEN", "Factor ELD")
-    _check_one_token_expiry(control, "LEADER_SESSION_TOKEN", "Leader ELD")
+    _check_one_token_expiry(control, "FACTOR_SESSION_TOKEN", "Factor ELD", factor_token, state)
+    _check_one_token_expiry(control, "LEADER_SESSION_TOKEN", "Leader ELD", leader_token, state)
 
 
-def _alert_new_unassigned_company(control, company_name, source, logger):
-    """The one place a genuinely new company (no section on any of this
-    team's dispatch boards) gets surfaced - persists it to
-    pending_companies.json (so it's only ever alerted on once, not every
-    cycle it stays unresolved) and pushes an immediate Telegram alert with
-    a single "Company Assign" button. Tapping it is a two-step drill-down
-    entirely handled by control_bot/router.py: first this one button, then
-    (once tapped) the real per-board choices + Skip - control_bot builds
-    those from its own stored Asana credentials, so sync.py doesn't need
-    an AsanaClient call just to name its own project ids here.
-
-    Does nothing under the legacy single-tenant setup (no TEAM_ID
-    configured there) - this feature is meaningful only once a team is
-    registered in the multi-tenant control_bot (see the plan's Phase 7),
-    since resolving a button tap requires that process's callback-handling
-    poller, which the old telegram_control.py has no equivalent of."""
-    team_id = os.environ.get("TEAM_ID", "").strip()
-    if not team_id or control is None:
-        return
-    pending_id = pending_companies.add_if_new(
-        os.getcwd(), company_name, source, datetime.now(timezone.utc).isoformat(),
-    )
-    if pending_id is None:
-        return  # already pending from an earlier cycle - don't re-alert
-
-    text = f"New company detected: '{company_name}' (via {source})"
-    notify_with_buttons = getattr(control, "notify_with_buttons", None)
-    if notify_with_buttons is None:
-        control.notify_all(f"{text} - which board should it join?")  # legacy bot: no buttons
-        return
-
-    notify_with_buttons(text, [("Company Assign", f"companyassign:{team_id}:{pending_id}")])
-
-
-def _sync_odometer_board(asana, odometer_project_ids_by_dispatch_id, logger, section_index):
+def _sync_odometer_board(
+    asana, odometer_project_ids_by_dispatch_id, logger, section_index,
+    factor_session_token=None, factor_tenant_id=None,
+    leader_session_token=None, leader_tenant_id=None,
+):
     """Sync every dispatch board's own Odometer Jump project: one task per
     driver who currently has an active odometer problem ("Odometer jump"
     or "Odometer is missing"), from BOTH Factor ELD and Leader ELD
@@ -347,15 +332,22 @@ def _sync_odometer_board(asana, odometer_project_ids_by_dispatch_id, logger, sec
     guessed at. Unlike the Database board, a task here only exists while
     Factor/Leader ELD is still reporting the problem - once it's no longer
     active, the task is deleted, the same way the dispatch boards delete a
-    task once a driver is no longer visible."""
+    task once a driver is no longer visible. The four *_token/*_tenant_id
+    params let a caller (multi_sync.py) pass one team's own credentials
+    explicitly instead of relying on process env vars - main() below omits
+    them, keeping its original env-var-based behavior."""
     issues_by_driver_id = {}
     try:
-        issues_by_driver_id.update(eld_factor.fetch_odometer_issues(logger))
+        issues_by_driver_id.update(eld_factor.fetch_odometer_issues(
+            logger, session_token=factor_session_token, tenant_id=factor_tenant_id,
+        ))
     except Exception:
         logger.exception("Factor ELD: odometer issue fetch failed this run.")
 
     try:
-        issues_by_driver_id.update(eld_leader.fetch_odometer_issues(logger))
+        issues_by_driver_id.update(eld_leader.fetch_odometer_issues(
+            logger, session_token=leader_session_token, tenant_id=leader_tenant_id,
+        ))
     except Exception:
         logger.exception("Leader ELD: odometer issue fetch failed this run.")
 
@@ -449,10 +441,30 @@ def _sync_one_odometer_project(asana, odometer_project_id, issues, logger):
         logger.exception("Odometer Jump board: failed to clean up empty company sections.")
 
 
-def run_one_cycle(asana, control=None, odometer_project_ids_by_dispatch_id=None):
+def run_one_cycle(
+    asana, control=None, odometer_project_ids_by_dispatch_id=None,
+    token_state=None,
+    factor_session_token=None, factor_tenant_id=None, factor_company_filter=None,
+    leader_session_token=None, leader_tenant_id=None,
+    staff_roster=None, algo_label=None,
+):
     """Fetch drivers from every ELD platform, match them to Asana tasks,
     and update anything that changed. Returns nothing - everything
-    interesting is written to the log."""
+    interesting is written to the log.
+
+    Every keyword-only-in-spirit param after odometer_project_ids_by_
+    dispatch_id lets a caller (multi_sync.py's per-team loop) pass that
+    team's own state/credentials explicitly instead of relying on process
+    env vars or module-global dedup state - see TokenAlertState's
+    docstring. main() below omits all of them, so its single-team behavior
+    is completely unchanged.
+
+    A driver whose company has no section on any dispatch board is only
+    ever logged as a warning here - never alerted over Telegram. Adding a
+    brand-new company to a board is a deliberate, admin-initiated action
+    via the bot's "Company Assign" menu (see control_bot/router.py's
+    _show_menu_create_section_boards/_prompt_create_section), not
+    something this sync loop offers to do automatically."""
 
     all_drivers = []
 
@@ -460,14 +472,19 @@ def run_one_cycle(asana, control=None, odometer_project_ids_by_dispatch_id=None)
     # is down (network error, expired login, bad response, etc.) the other
     # one still runs normally instead of the whole sync failing.
     try:
-        all_drivers.extend(eld_factor.fetch_drivers(logger))
-        _mark_factor_fetch_ok()
+        all_drivers.extend(eld_factor.fetch_drivers(
+            logger, session_token=factor_session_token, tenant_id=factor_tenant_id,
+            company_filter=factor_company_filter,
+        ))
+        _mark_factor_fetch_ok(token_state)
     except Exception as exc:
         logger.exception("Factor ELD fetch failed this run - continuing without it.")
-        _handle_factor_fetch_failure(exc, control)
+        _handle_factor_fetch_failure(exc, control, token_state)
 
     try:
-        all_drivers.extend(eld_leader.fetch_drivers(logger))
+        all_drivers.extend(eld_leader.fetch_drivers(
+            logger, session_token=leader_session_token, tenant_id=leader_tenant_id,
+        ))
     except Exception:
         logger.exception("Leader ELD fetch failed this run - continuing without it.")
 
@@ -483,7 +500,11 @@ def run_one_cycle(asana, control=None, odometer_project_ids_by_dispatch_id=None)
         return
 
     if odometer_project_ids_by_dispatch_id:
-        _sync_odometer_board(asana, odometer_project_ids_by_dispatch_id, logger, section_index)
+        _sync_odometer_board(
+            asana, odometer_project_ids_by_dispatch_id, logger, section_index,
+            factor_session_token=factor_session_token, factor_tenant_id=factor_tenant_id,
+            leader_session_token=leader_session_token, leader_tenant_id=leader_tenant_id,
+        )
 
     changed_count = 0
     unchanged_count = 0
@@ -541,7 +562,10 @@ def run_one_cycle(asana, control=None, odometer_project_ids_by_dispatch_id=None)
 
     staff_editors_by_id = {}
     try:
-        staff_editors_by_id.update(eld_factor.fetch_staff_editors(factor_driver_ids, logger))
+        staff_editors_by_id.update(eld_factor.fetch_staff_editors(
+            factor_driver_ids, logger, session_token=factor_session_token,
+            tenant_id=factor_tenant_id, staff_roster=staff_roster, algo_label=algo_label,
+        ))
     except Exception:
         logger.exception(
             "Factor ELD: failed to fetch logbook edit history - continuing "
@@ -549,7 +573,10 @@ def run_one_cycle(asana, control=None, odometer_project_ids_by_dispatch_id=None)
         )
 
     try:
-        staff_editors_by_id.update(eld_leader.fetch_staff_editors(leader_driver_ids, logger))
+        staff_editors_by_id.update(eld_leader.fetch_staff_editors(
+            leader_driver_ids, logger, session_token=leader_session_token,
+            tenant_id=leader_tenant_id, staff_roster=staff_roster, algo_label=algo_label,
+        ))
     except Exception:
         logger.exception(
             "Leader ELD: failed to fetch logbook edit history - continuing "
@@ -597,10 +624,10 @@ def run_one_cycle(asana, control=None, odometer_project_ids_by_dispatch_id=None)
                 not_found_count += 1
                 logger.warning(
                     "%s: no matching Asana task found, and no existing section for "
-                    "company '%s' to create one in (source: %s, status: %s)",
+                    "company '%s' to create one in (source: %s, status: %s) - use the "
+                    "bot's 'Company Assign' menu to add it to a board.",
                     driver.name, driver.company_name, driver.source, driver.status,
                 )
-                _alert_new_unassigned_company(control, driver.company_name, driver.source, logger)
             continue
 
         if invisibility_reason is not None:
@@ -915,7 +942,11 @@ def run_one_cycle(asana, control=None, odometer_project_ids_by_dispatch_id=None)
 DATABASE_SYNC_INTERVAL_SECONDS = 1 * 60 * 60
 
 
-def run_database_cycle(asana, database_project_id, control=None):
+def run_database_cycle(
+    asana, database_project_id, control=None, token_state=None,
+    factor_session_token=None, factor_tenant_id=None,
+    leader_session_token=None, leader_tenant_id=None,
+):
     """Sync the standalone 'Database' board: every driver (active AND
     inactive) from BOTH Factor ELD and Leader ELD (confirmed this board is
     shared/common across both platforms, not a separate one per platform),
@@ -923,17 +954,23 @@ def run_database_cycle(asana, database_project_id, control=None):
     company is seen). Only ever creates or updates - never deletes, even
     once a driver goes inactive (a deliberate difference from the dispatch
     boards in run_one_cycle, which do delete - confirmed this board is
-    meant to be a permanent record instead)."""
+    meant to be a permanent record instead). token_state/*_token/*_tenant_id
+    let a caller (multi_sync.py) pass one team's own state/credentials
+    explicitly - main() below omits them, unchanged single-team behavior."""
     records = []
     try:
-        records.extend(eld_factor.fetch_driver_database_records(logger))
-        _mark_factor_fetch_ok()
+        records.extend(eld_factor.fetch_driver_database_records(
+            logger, session_token=factor_session_token, tenant_id=factor_tenant_id,
+        ))
+        _mark_factor_fetch_ok(token_state)
     except Exception as exc:
         logger.exception("Factor ELD: driver database fetch failed this run.")
-        _handle_factor_fetch_failure(exc, control)
+        _handle_factor_fetch_failure(exc, control, token_state)
 
     try:
-        records.extend(eld_leader.fetch_driver_database_records(logger))
+        records.extend(eld_leader.fetch_driver_database_records(
+            logger, session_token=leader_session_token, tenant_id=leader_tenant_id,
+        ))
     except Exception:
         logger.exception("Leader ELD: driver database fetch failed this run.")
 

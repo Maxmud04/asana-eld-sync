@@ -5,21 +5,30 @@ Entrypoint for the singleton control-bot process - the one process allowed
 to long-poll the shared Telegram bot token (see gateway.py's docstring for
 why). Reads its own small .env (control_bot/.env, see .env.example in this
 directory) - never the per-team ones under teams/<team_id>/.
+
+This process now also runs multi_sync.py's shared per-team sync loop on a
+background thread, alongside the Telegram bot itself - one process, every
+active team's dispatch/Database/Odometer sync, no per-team OS process to
+spawn (see multi_sync.py's own docstring for why this replaced the old
+supervisor.py-based design). Set MULTI_SYNC_ENABLED=false to disable this
+and run only the bot (e.g. if you're still running teams via the old
+per-process sync.py + supervisor.py setup instead).
 """
 
 import logging
 import os
+import threading
 import time
 
 from dotenv import load_dotenv
 
+import multi_sync
 from control_bot import validators
 from control_bot.config_store import ConfigStore
 from control_bot.gateway import TelegramGateway
 from control_bot.onboarding import OnboardingManager
 from control_bot.provisioning import Provisioner
 from control_bot.router import TeamRouter
-from control_bot.supervisor import Supervisor
 
 _HERE = os.path.dirname(__file__)
 
@@ -40,15 +49,28 @@ def main():
     teams_root_dir = os.environ.get("TEAMS_ROOT_DIR", os.path.join(os.path.dirname(_HERE), "teams"))
 
     config_store = ConfigStore(db_path, master_key_path)
-    supervisor = Supervisor(teams_root_dir, logger)
-    provisioning = Provisioner(config_store, supervisor, teams_root_dir, bot_token, logger)
+    provisioning = Provisioner(config_store, teams_root_dir, bot_token, logger)
 
     gateway = TelegramGateway(bot_token, on_message=None, logger=logger)
     onboarding = OnboardingManager(gateway, config_store, validators, provisioning, logger)
-    router = TeamRouter(gateway, config_store, onboarding, provisioning, supervisor, logger)
+    router = TeamRouter(gateway, config_store, onboarding, provisioning, logger)
     gateway.on_message = router.handle_update
 
     gateway.start()
+
+    if os.environ.get("MULTI_SYNC_ENABLED", "true").strip().lower() != "false":
+        poll_interval_minutes = float(os.environ.get("POLL_INTERVAL_MINUTES", "5"))
+        sync_logger = logging.getLogger("multi_sync")
+        sync_thread = threading.Thread(
+            target=multi_sync.sync_loop_forever,
+            args=(config_store, bot_token, sync_logger, poll_interval_minutes),
+            daemon=True,
+        )
+        sync_thread.start()
+        logger.info("Multi-team sync loop started (every %s minute(s)).", poll_interval_minutes)
+    else:
+        logger.info("MULTI_SYNC_ENABLED=false - bot only, no sync loop in this process.")
+
     logger.info("Control bot running. Ctrl+C to stop.")
     try:
         while True:

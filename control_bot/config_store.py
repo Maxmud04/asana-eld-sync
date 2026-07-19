@@ -82,6 +82,23 @@ CREATE TABLE IF NOT EXISTS chat_active_team (
 );
 """
 
+# DB-backed replacement for pending_companies.py's per-team JSON file, for
+# the single-service deployment mode (see multi_sync.py) where there is no
+# per-team working directory to keep such a file in - one process handles
+# every team. add_if_new/pop/get below mirror that module's exact
+# semantics (see its own docstring) so router.py's callback handlers work
+# identically regardless of which mode produced the alert.
+_SCHEMA_PENDING_COMPANIES = """
+CREATE TABLE IF NOT EXISTS pending_companies (
+    team_id TEXT NOT NULL,
+    pending_id TEXT NOT NULL,
+    company_name TEXT NOT NULL,
+    source TEXT NOT NULL,
+    first_seen TEXT NOT NULL,
+    PRIMARY KEY (team_id, pending_id)
+);
+"""
+
 # Fields whose value is stored encrypted (as "<field>_enc") rather than
 # plaintext - see _prepare_row/_decode_team_row.
 _ENCRYPTED_FIELDS = {"asana_token", "factor_session_token", "leader_session_token"}
@@ -120,6 +137,7 @@ class ConfigStore:
             conn.executescript(_SCHEMA)
             self._migrate_team_admins(conn)
             conn.executescript(_SCHEMA_CHAT_ACTIVE_TEAM)
+            conn.executescript(_SCHEMA_PENDING_COMPANIES)
 
     def _migrate_team_admins(self, conn):
         """Create team_admins fresh (new composite-PK shape) if it doesn't
@@ -302,3 +320,32 @@ class ConfigStore:
     def clear_onboarding_session(self, chat_id):
         with self._lock, self._connect() as conn:
             conn.execute("DELETE FROM onboarding_sessions WHERE chat_id = ?", (chat_id,))
+
+    # ---------- pending companies ----------
+    # sync.py no longer auto-alerts on a newly-detected, unassigned company
+    # (that's now a deliberate admin action only - see router.py's "Company
+    # Assign" menu) - get/pop below just resolve any button taps still
+    # coming in against pending_companies rows created before that change.
+
+    def get_pending_company(self, team_id, pending_id):
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT company_name, source, first_seen FROM pending_companies "
+                "WHERE team_id = ? AND pending_id = ?",
+                (team_id, pending_id),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def pop_pending_company(self, team_id, pending_id):
+        """Remove and return one entry (the caller has just assigned it to
+        a board), or None if it wasn't there (already resolved, or a stale
+        button tap)."""
+        entry = self.get_pending_company(team_id, pending_id)
+        if entry is None:
+            return None
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "DELETE FROM pending_companies WHERE team_id = ? AND pending_id = ?",
+                (team_id, pending_id),
+            )
+        return entry
