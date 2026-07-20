@@ -1264,16 +1264,22 @@ class AsanaClient:
 
     def create_enum_custom_field(self, workspace_gid, name, option_names=None):
         """POST a brand-new workspace-level enum custom field, optionally
-        with the given option names created in that order. Omit/empty
-        option_names to create the field with no options yet - Staff ID and
-        Staff ID History are never generic/template-able the way Violation
-        is (confirmed live: they're literally one team's own staff roster),
-        so those two get created empty here and populated per-team from
-        onboarding's roster collection via add_enum_option() below. Returns
-        (field_gid, {option_name: option_gid})."""
-        data = {"workspace": workspace_gid, "name": name, "resource_subtype": "enum"}
-        if option_names:
-            data["enum_options"] = [{"name": n} for n in option_names]
+        with the given option names created in that order. Asana rejects
+        creating an enum field with zero options outright (confirmed live:
+        both an omitted enum_options key AND an explicit empty list get a
+        400 "An enum custom field must have at least 1 option") - so
+        omit/empty option_names falls back to one placeholder option
+        rather than failing. This matters for Staff ID and Staff ID
+        History, which are never generic/template-able the way Violation
+        is (they're literally one team's own staff roster) - those two
+        start with just the placeholder and get populated per-team from
+        onboarding's roster collection via add_enum_option() below.
+        Returns (field_gid, {option_name: option_gid})."""
+        names = list(option_names) if option_names else ["(none yet)"]
+        data = {
+            "workspace": workspace_gid, "name": name, "resource_subtype": "enum",
+            "enum_options": [{"name": n} for n in names],
+        }
         field = self._request("POST", f"{ASANA_API_BASE}/custom_fields", json={"data": data})
         field_data = field["data"]
         options = {opt["name"]: opt["gid"] for opt in field_data.get("enum_options", [])}
