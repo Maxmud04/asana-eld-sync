@@ -22,9 +22,17 @@ from eld_common import invisibility_reason
 _JWT_LIKE_PATTERN = re.compile(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$")
 
 _ROTATABLE_FIELDS = {
-    "/rotatefactor": ("factor_session_token", "Factor ELD"),
-    "/rotateleader": ("leader_session_token", "Leader ELD"),
-    "/rotateasana": ("asana_token", "Asana"),
+    # (session/access token field, display label, matching tenant_id field
+    # or None). Factor/Leader ELD scope which companies are visible by
+    # tenant_id, not the token alone (confirmed live: a team can hold a
+    # perfectly valid token whose tenant_id is a DIFFERENT team's -
+    # exactly what put one team's driver data onto another team's boards)
+    # - so those two rotate as a token+tenant_id PAIR, validated together,
+    # never the token alone against a possibly-stale tenant_id. Asana has
+    # no such concept, so it stays a single-step rotation.
+    "/rotatefactor": ("factor_session_token", "Factor ELD", "factor_tenant_id"),
+    "/rotateleader": ("leader_session_token", "Leader ELD", "leader_tenant_id"),
+    "/rotateasana": ("asana_token", "Asana", None),
 }
 
 # The bot's main menu, styled after Telegram's own nested settings menus
@@ -91,10 +99,12 @@ class TeamRouter:
         session = self.config_store.get_onboarding_session(chat_id)
         if session is not None:
             state, data = session
-            if state.startswith("AWAITING_ROTATION:"):
+            if state.startswith("AWAITING_ROTATION:") or state.startswith("AWAITING_ROTATION_TENANT:"):
                 # Always legitimate - only ever created for an already-
                 # registered team (see _prompt_rotation) - takes priority
-                # over everything else for this chat_id.
+                # over everything else for this chat_id. _handle_rotation_reply
+                # itself branches on which of the two states this is (token
+                # step vs the tenant_id step that follows for Factor/Leader).
                 self._handle_rotation_reply(chat_id, state, data, raw_text)
             elif state == "AWAITING_COMPANY_NAME":
                 # Always legitimate - only ever created for an already-
@@ -326,7 +336,7 @@ class TeamRouter:
         elif action.startswith("createsection:"):
             self._prompt_create_section(chat_id, message_id, team_id, action.split(":", 1)[1])
         elif action == "rotate":
-            buttons = [(label, f"menu:rotate:{cmd}") for cmd, (_, label) in _ROTATABLE_FIELDS.items()]
+            buttons = [(label, f"menu:rotate:{cmd}") for cmd, (_, label, _tenant_field) in _ROTATABLE_FIELDS.items()]
             buttons.append(BACK_BUTTON)
             self.gateway.edit_message_text(chat_id, message_id, "Which token would you like to rotate?", buttons=buttons)
         elif action == "trucks":
@@ -532,9 +542,10 @@ class TeamRouter:
         )
 
     def _prompt_rotation(self, chat_id, team_id, command_text):
-        field_name, label = _ROTATABLE_FIELDS[command_text]
+        field_name, label, tenant_field = _ROTATABLE_FIELDS[command_text]
         self.config_store.save_onboarding_session(
-            chat_id, f"AWAITING_ROTATION:{field_name}", {"team_id": team_id, "label": label},
+            chat_id, f"AWAITING_ROTATION:{field_name}",
+            {"team_id": team_id, "label": label, "tenant_field": tenant_field},
         )
         # "« Back to Bot" here is equivalent to /cancel (see menu:main's
         # handling, which always clears any pending onboarding/rotation
@@ -542,33 +553,32 @@ class TeamRouter:
         # silently waiting for the next thing you happen to type.
         self.gateway.send_buttons(chat_id, f"Paste the new {label} token now (or /cancel to stop).", [BACK_BUTTON])
 
-    def _validate_rotation_value(self, field_name, new_value, team):
-        """Live-checks a rotation's pasted value the same way onboarding
-        validates a brand-new team's credentials (see validators.py),
-        before ever committing it. Added after a real incident: pasting a
-        stray "/trucks" message while mid-rotation silently overwrote the
-        real Asana token, because nothing here previously checked the
-        value was a real, working credential before saving it."""
+    def _validate_rotation_pair(self, field_name, new_token, new_tenant_id):
+        """Live-checks a Factor/Leader ELD token TOGETHER with its
+        tenant_id, before committing either - see _ROTATABLE_FIELDS'
+        comment for why these two are never rotated independently."""
         if field_name == "factor_session_token":
-            return validators.check_factor(new_value, team["factor_tenant_id"])
+            return validators.check_factor(new_token, new_tenant_id)
         if field_name == "leader_session_token":
-            return validators.check_leader(new_value, team["leader_tenant_id"])
-        if field_name == "asana_token":
-            ok, result = validators.check_asana(new_value)
-            return (True, f"{len(result)} workspace(s) visible") if ok else (False, result)
+            return validators.check_leader(new_token, new_tenant_id)
         return False, "unknown field"
 
     def _handle_rotation_reply(self, chat_id, state, data, raw_text):
         if raw_text.strip().lower() == "/cancel":
             self.config_store.clear_onboarding_session(chat_id)
-            self.gateway.send_buttons(chat_id, "Cancelled - token left unchanged.", [BACK_BUTTON])
+            self.gateway.send_buttons(chat_id, "Cancelled - nothing changed.", [BACK_BUTTON])
+            return
+
+        if state.startswith("AWAITING_ROTATION_TENANT:"):
+            self._handle_rotation_tenant_reply(chat_id, state, data, raw_text)
             return
 
         field_name = state.split(":", 1)[1]
         new_value = _clean_pasted_value(raw_text)
         # Cheap, fast-failing check before ever hitting the network - the
-        # exact shape of the incident above (a bot command pasted instead
-        # of a token).
+        # exact shape of a real past incident: a bot command pasted
+        # instead of a token silently overwrote a real credential because
+        # nothing checked the value looked like one first.
         if not new_value or new_value.startswith("/"):
             self.gateway.send_message(
                 chat_id, "That doesn't look like a token - paste the actual token value, or /cancel to stop.",
@@ -576,20 +586,63 @@ class TeamRouter:
             return
 
         team_id = data["team_id"]
-        team = self.config_store.get_team(team_id)
-        ok, message = self._validate_rotation_value(field_name, new_value, team)
-        if not ok:
-            self.gateway.send_message(
-                chat_id,
-                f"That {data['label']} token was rejected: {message}\n\nPaste it again, or /cancel to stop.",
+        tenant_field = data.get("tenant_field")
+
+        if tenant_field is None:
+            # Asana - no tenant_id concept, single-step as before.
+            ok, result = validators.check_asana(new_value)
+            message = f"{len(result)} workspace(s) visible" if ok else result
+            if not ok:
+                self.gateway.send_message(
+                    chat_id, f"That {data['label']} token was rejected: {message}\n\nPaste it again, or /cancel to stop.",
+                )
+                return
+            self.config_store.update_team(team_id, **{field_name: new_value})
+            self.config_store.clear_onboarding_session(chat_id)
+            self.provisioning.rewrite_env(team_id)
+            self.gateway.send_buttons(
+                chat_id, f"{data['label']} token updated ({message}) - takes effect on the next sync cycle.", [BACK_BUTTON],
             )
             return
 
-        self.config_store.update_team(team_id, **{field_name: new_value})
+        # Factor/Leader ELD - hold the new token, ask for its matching
+        # tenant_id next, and validate the PAIR together before saving
+        # either (see _ROTATABLE_FIELDS' comment).
+        data["pending_token"] = new_value
+        self.config_store.save_onboarding_session(chat_id, f"AWAITING_ROTATION_TENANT:{field_name}", data)
+        self.gateway.send_message(chat_id, f"Now paste the matching {data['label']} tenant_id (or /cancel to stop).")
+
+    def _handle_rotation_tenant_reply(self, chat_id, state, data, raw_text):
+        new_tenant_id = _clean_pasted_value(raw_text)
+        if not new_tenant_id or new_tenant_id.startswith("/"):
+            self.gateway.send_message(
+                chat_id, "That doesn't look like a tenant_id - paste it again, or /cancel to stop.",
+            )
+            return
+
+        field_name = state.split(":", 1)[1]
+        team_id = data["team_id"]
+        tenant_field = data["tenant_field"]
+        ok, message = self._validate_rotation_pair(field_name, data["pending_token"], new_tenant_id)
+        if not ok:
+            self.gateway.send_message(
+                chat_id,
+                f"That {data['label']} token/tenant_id pair was rejected: {message}\n\n"
+                f"Paste the {data['label']} token again, or /cancel to stop.",
+            )
+            # Back to square one (fresh token) rather than re-asking just
+            # for a tenant_id against a token we now know is unverified.
+            self.config_store.save_onboarding_session(
+                chat_id, f"AWAITING_ROTATION:{field_name}",
+                {"team_id": team_id, "label": data["label"], "tenant_field": tenant_field},
+            )
+            return
+
+        self.config_store.update_team(team_id, **{field_name: data["pending_token"], tenant_field: new_tenant_id})
         self.config_store.clear_onboarding_session(chat_id)
         self.provisioning.rewrite_env(team_id)
         self.gateway.send_buttons(
             chat_id,
-            f"{data['label']} token updated ({message}) - takes effect on the next sync cycle.",
+            f"{data['label']} token + tenant_id updated ({message}) - takes effect on the next sync cycle.",
             [BACK_BUTTON],
         )
