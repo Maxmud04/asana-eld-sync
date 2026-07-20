@@ -1238,6 +1238,15 @@ class AsanaClient:
             f"{ASANA_API_BASE}/users/me?opt_fields=name,email,workspaces.name,workspaces.gid",
         )["data"]
 
+    def get_project_name(self, project_id):
+        """GET /projects/{id} - just the name, for confirming a pasted
+        project link/id during onboarding actually resolves to something
+        this token can see (e.g. an existing Database board a team already
+        has - see control_bot/validators.py's check_asana_project)."""
+        return self._request(
+            "GET", f"{ASANA_API_BASE}/projects/{project_id}?opt_fields=name",
+        )["data"]["name"]
+
     def get_workspace_info(self, workspace_gid):
         """GET /workspaces/{gid}. is_organization matters because an
         organization-tier workspace requires a Team gid to create a project

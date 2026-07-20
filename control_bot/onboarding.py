@@ -25,6 +25,7 @@ STATE_ASK_ASANA_TOKEN = "ASK_ASANA_TOKEN"
 STATE_ASK_WORKSPACE_CHOICE = "ASK_WORKSPACE_CHOICE"
 STATE_ASK_ORG_TEAM_CHOICE = "ASK_ORG_TEAM_CHOICE"
 STATE_ASK_BOARD_NAMES = "ASK_BOARD_NAMES"
+STATE_ASK_DATABASE_BOARD = "ASK_DATABASE_BOARD"
 STATE_ASK_STAFF_ROSTER = "ASK_STAFF_ROSTER"
 STATE_CONFIRM = "CONFIRM"
 
@@ -34,6 +35,23 @@ STATE_CONFIRM = "CONFIRM"
 # hire later doesn't need a whole new onboarding conversation to parse the
 # same "Name: Code" shape.
 _ROSTER_LINE_PATTERN = re.compile(r"^\s*([A-Za-z][A-Za-z\-' ]*)\s*[:,\-]\s*([A-Za-z0-9#]+)\s*$")
+
+# A pasted Asana project link ("https://app.asana.com/1/<workspace>/project/
+# <project_id>/...") or a bare numeric project id - most teams already have
+# a Database board with real driver history, so onboarding asks for the
+# existing one instead of always creating a brand-new empty one (see
+# _ask_database_board/provisioning.py's provision_team).
+_ASANA_PROJECT_URL_PATTERN = re.compile(r"/project/(\d+)")
+
+
+def _parse_asana_project_ref(text):
+    """Extract a project_id from a pasted Asana URL or bare numeric id, or
+    None if text doesn't look like either."""
+    text = text.strip()
+    match = _ASANA_PROJECT_URL_PATTERN.search(text)
+    if match:
+        return match.group(1)
+    return text if text.isdigit() else None
 
 
 def _slugify(team_name):
@@ -89,6 +107,7 @@ class OnboardingManager:
             STATE_ASK_WORKSPACE_CHOICE: self._handle_workspace_choice,
             STATE_ASK_ORG_TEAM_CHOICE: self._handle_org_team_choice,
             STATE_ASK_BOARD_NAMES: self._handle_board_names,
+            STATE_ASK_DATABASE_BOARD: self._handle_database_board,
             STATE_ASK_STAFF_ROSTER: self._handle_staff_roster,
             STATE_CONFIRM: self._handle_confirm,
         }.get(state)
@@ -262,6 +281,41 @@ class OnboardingManager:
             self.gateway.send_message(chat_id, "Please send at least one board name.")
             return
         data["dispatch_board_names"] = board_names
+        self._ask_database_board(chat_id, data)
+
+    def _ask_database_board(self, chat_id, data):
+        self._advance(chat_id, STATE_ASK_DATABASE_BOARD, data)
+        self.gateway.send_message(
+            chat_id,
+            "Do you already have a Database board in Asana (a permanent "
+            "record of every driver, active or inactive)? If so, paste its "
+            "project link or ID and syncing will only ever add new drivers "
+            "to it - your existing history is never touched or rewritten. "
+            "Send /skip if you don't have one yet and want a new one created.",
+        )
+
+    def _handle_database_board(self, chat_id, sender_id, data, text):
+        if text.lower() == "/skip":
+            data["existing_database_project_id"] = None
+            self._ask_staff_roster(chat_id, data)
+            return
+
+        project_id = _parse_asana_project_ref(text)
+        if project_id is None:
+            self.gateway.send_message(
+                chat_id, "Couldn't read a project link or ID from that - paste it again, or /skip.",
+            )
+            return
+
+        ok, result = self.validators.check_asana_project(data["asana_token"], project_id)
+        if not ok:
+            self.gateway.send_message(
+                chat_id, f"Couldn't access that project: {result}\n\nPaste the link/ID again, or /skip.",
+            )
+            return
+
+        data["existing_database_project_id"] = project_id
+        self.gateway.send_message(chat_id, f"Found it: '{result}'.")
         self._ask_staff_roster(chat_id, data)
 
     def _ask_staff_roster(self, chat_id, data):
@@ -286,12 +340,18 @@ class OnboardingManager:
                 return
         data["staff_roster"] = roster
         self._advance(chat_id, STATE_CONFIRM, data)
+        database_board_line = (
+            f"Database board: existing project {data['existing_database_project_id']}"
+            if data.get("existing_database_project_id")
+            else "Database board: new one will be created"
+        )
         summary = (
             f"Team: {data['team_name']}\n"
             f"Factor ELD: {'configured' if data.get('factor_session_token') else 'skipped'}\n"
             f"Leader ELD: {'configured' if data.get('leader_session_token') else 'skipped'}\n"
             f"Asana workspace: {data['workspace_gid']}\n"
             f"Dispatch board(s): {', '.join(data['dispatch_board_names'])}\n"
+            f"{database_board_line}\n"
             f"Staff roster entries: {len(roster)}\n\n"
             "Reply /confirm to create your boards now, or /cancel to start over."
         )

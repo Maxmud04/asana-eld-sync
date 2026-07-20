@@ -57,6 +57,18 @@ def check_asana(token):
     return True, me.get("workspaces", [])
 
 
+def check_asana_project(token, project_id):
+    """Returns (True, project_name) or (False, message) - confirms a pasted
+    existing-Database-board link/id (see onboarding.py's
+    _handle_database_board) actually resolves, before saving it as the
+    team's permanent driver-history board."""
+    try:
+        name = asana_client.AsanaClient(token, [], _logger).get_project_name(project_id)
+    except Exception as exc:
+        return False, str(exc)
+    return True, name
+
+
 def workspace_info(token, workspace_gid):
     return asana_client.AsanaClient(token, [], _logger).get_workspace_info(workspace_gid)
 

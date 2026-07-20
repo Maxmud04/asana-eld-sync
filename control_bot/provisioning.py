@@ -56,7 +56,15 @@ class Provisioner:
             dispatch_project_ids.append(project_id)
             self._populate_staff_roster(client, project_id, data.get("staff_roster") or {})
 
-        database_project_id = client.bootstrap_database_project(
+        # Most teams already have a Database board with real driver history
+        # by the time they onboard here - reuse it (see onboarding.py's
+        # _ask_database_board) instead of creating a competing empty one.
+        # No field/name mismatch risk: _get_database_project_config already
+        # matches columns by NAME (DATABASE_FIELD_NAME_CANDIDATES), not by
+        # gid, and run_database_cycle only ever creates/updates - it never
+        # deletes or rewrites existing rows, so pointing at an existing
+        # board is exactly as safe as pointing at a brand-new one.
+        database_project_id = data.get("existing_database_project_id") or client.bootstrap_database_project(
             workspace_gid, f"{team_name} {_DATABASE_BOARD_SUFFIX}", team_gid,
         )
         odometer_project_id = client.bootstrap_odometer_project(
