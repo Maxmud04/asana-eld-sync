@@ -390,7 +390,9 @@ class TeamRouter:
             chat_id, "AWAITING_COMPANY_NAME", {"team_id": team_id, "project_id": project_id, "project_name": project_name},
         )
         self.gateway.edit_message_text(
-            chat_id, message_id, f"Send the company name to create in {project_name} (or /cancel to stop).",
+            chat_id, message_id,
+            f"Send the company name(s) to create in {project_name} - one per "
+            "line for several at once (or /cancel to stop).",
             buttons=[BACK_BUTTON],
         )
 
@@ -400,18 +402,41 @@ class TeamRouter:
             self.config_store.clear_onboarding_session(chat_id)
             self.gateway.send_buttons(chat_id, "Cancelled.", [BACK_BUTTON])
             return
-        if not text:
-            self.gateway.send_message(chat_id, "Please send a company name, or /cancel to stop.")
+        names = [line.strip() for line in text.splitlines() if line.strip()]
+        if not names:
+            self.gateway.send_message(chat_id, "Please send at least one company name, or /cancel to stop.")
             return
 
         team = self.config_store.get_team(data["team_id"])
         client = asana_client.AsanaClient(team["asana_token"], [], self.logger)
-        client.create_section(data["project_id"], text)
+        project_id = data["project_id"]
+
+        # Skip any name that already has a section here rather than blindly
+        # creating a duplicate (create_section itself has no such check -
+        # see its docstring) - matters once a board already has some
+        # sections, and cheap insurance against re-pasting the same bulk
+        # list twice by mistake.
+        existing = {
+            asana_client.normalize_company_name(s.get("name") or "")
+            for s in client._fetch_sections(project_id)
+        }
+        created, skipped = [], []
+        for name in names:
+            if asana_client.normalize_company_name(name) in existing:
+                skipped.append(name)
+                continue
+            client.create_section(project_id, name)
+            existing.add(asana_client.normalize_company_name(name))
+            created.append(name)
+
         self.config_store.clear_onboarding_session(chat_id)
-        self.gateway.send_buttons(
-            chat_id, f"Created '{text}' in {data['project_name']} - drivers there will start showing up next sync cycle.",
-            [BACK_BUTTON],
-        )
+        lines = []
+        if created:
+            lines.append(f"Created {len(created)} section(s) in {data['project_name']}: {', '.join(created)}")
+            lines.append("Drivers there will start showing up next sync cycle.")
+        if skipped:
+            lines.append(f"Already existed, skipped: {', '.join(skipped)}")
+        self.gateway.send_buttons(chat_id, "\n".join(lines) or "Nothing to do.", [BACK_BUTTON])
 
     def _handle_staff_add_reply(self, chat_id, data, raw_text):
         text = raw_text.strip()
