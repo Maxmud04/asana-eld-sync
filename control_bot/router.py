@@ -16,6 +16,7 @@ import asana_client
 import eld_factor
 import eld_leader
 from control_bot import validators
+from control_bot.onboarding import _ROSTER_LINE_PATTERN
 from eld_common import invisibility_reason
 
 _JWT_LIKE_PATTERN = re.compile(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$")
@@ -33,6 +34,7 @@ MAIN_MENU_BUTTONS = [
     ("Company Assign", "menu:companyassign"),
     ("Rotate Tokens", "menu:rotate"),
     ("Truck Numbers", "menu:trucks"),
+    ("Staff Roster", "menu:staffroster"),
 ]
 MAIN_MENU_TEXT = "Main Menu:"
 BACK_BUTTON = ("« Back to Bot", "menu:main")
@@ -98,6 +100,10 @@ class TeamRouter:
                 # Always legitimate - only ever created for an already-
                 # registered team (see _prompt_create_section).
                 self._handle_create_section_reply(chat_id, data, raw_text)
+            elif state == "AWAITING_STAFF_ADD":
+                # Always legitimate - only ever created for an already-
+                # registered team (see _prompt_staff_roster_add).
+                self._handle_staff_add_reply(chat_id, data, raw_text)
             else:
                 # A chat that already administers other teams can
                 # legitimately be mid-onboarding for one MORE (see "Add
@@ -332,8 +338,31 @@ class TeamRouter:
             rotate_command = action.split(":", 1)[1]
             self.gateway.edit_message_text(chat_id, message_id, f"Selected: {_ROTATABLE_FIELDS[rotate_command][1]}")
             self._prompt_rotation(chat_id, team_id, rotate_command)
+        elif action == "staffroster":
+            self._show_menu_staff_roster(chat_id, message_id, team_id)
+        elif action == "staffroster:add":
+            self._prompt_staff_roster_add(chat_id, message_id, team_id)
         else:
             self.logger.warning("Unrecognized menu action: %r", action)
+
+    def _show_menu_staff_roster(self, chat_id, message_id, team_id):
+        team = self.config_store.get_team(team_id)
+        roster = team.get("staff_roster") or {}
+        if roster:
+            lines = "\n".join(f"  {name.title()}: {code}" for name, code in sorted(roster.items()))
+            text = f"Current staff roster:\n{lines}"
+        else:
+            text = "No staff roster entries yet."
+        buttons = [("Add Person", "menu:staffroster:add"), BACK_BUTTON]
+        self.gateway.edit_message_text(chat_id, message_id, text, buttons=buttons)
+
+    def _prompt_staff_roster_add(self, chat_id, message_id, team_id):
+        self.config_store.save_onboarding_session(chat_id, "AWAITING_STAFF_ADD", {"team_id": team_id})
+        self.gateway.edit_message_text(
+            chat_id, message_id,
+            "Send the new person as 'FirstName: Code' (e.g. 'David: D195'), "
+            "or /cancel to stop.",
+        )
 
     def _show_menu_create_section_boards(self, chat_id, message_id, team_id):
         """The menu's "Company Assign" entry - lets you pick a board first,
@@ -382,6 +411,27 @@ class TeamRouter:
         self.gateway.send_buttons(
             chat_id, f"Created '{text}' in {data['project_name']} - drivers there will start showing up next sync cycle.",
             [BACK_BUTTON],
+        )
+
+    def _handle_staff_add_reply(self, chat_id, data, raw_text):
+        text = raw_text.strip()
+        if text.lower() == "/cancel":
+            self.config_store.clear_onboarding_session(chat_id)
+            self.gateway.send_buttons(chat_id, "Cancelled.", [BACK_BUTTON])
+            return
+
+        match = _ROSTER_LINE_PATTERN.match(text)
+        if not match:
+            self.gateway.send_message(
+                chat_id, "Couldn't read that - send it as 'FirstName: Code' (e.g. 'David: D195'), or /cancel.",
+            )
+            return
+
+        first_name, code = match.group(1).strip(), match.group(2).strip()
+        self.provisioning.add_staff_roster_entry(data["team_id"], first_name, code)
+        self.config_store.clear_onboarding_session(chat_id)
+        self.gateway.send_buttons(
+            chat_id, f"Added '{first_name.title()}: {code}' to the staff roster.", [BACK_BUTTON],
         )
 
     def _show_menu_switch_team(self, chat_id, message_id):

@@ -41,9 +41,21 @@ class Provisioner:
         team_gid = data.get("asana_team_gid")
         team_name = data["team_name"]
 
-        dispatch_project_id = client.bootstrap_dispatch_project(
-            workspace_gid, f"{team_name} {_DISPATCH_BOARD_SUFFIX}", team_gid,
-        )
+        # One dispatch board per name onboarding collected (see
+        # onboarding.py's _ask_board_names) - most teams send just one, but
+        # a team like "original" (Texas A/B/C) needs several. Each board
+        # gets its OWN separate Status/Vehicle Number/Violation/Staff ID
+        # fields (bootstrap_dispatch_project creates fresh ones every call,
+        # never reuses one across boards) - so a multi-board team's Staff
+        # ID roster has to be pushed to every board's own fields, see
+        # add_staff_roster_entry below for the same reason on later adds.
+        board_names = data.get("dispatch_board_names") or [f"{team_name} {_DISPATCH_BOARD_SUFFIX}"]
+        dispatch_project_ids = []
+        for board_name in board_names:
+            project_id = client.bootstrap_dispatch_project(workspace_gid, board_name, team_gid)
+            dispatch_project_ids.append(project_id)
+            self._populate_staff_roster(client, project_id, data.get("staff_roster") or {})
+
         database_project_id = client.bootstrap_database_project(
             workspace_gid, f"{team_name} {_DATABASE_BOARD_SUFFIX}", team_gid,
         )
@@ -51,15 +63,13 @@ class Provisioner:
             workspace_gid, f"{team_name} {_ODOMETER_BOARD_SUFFIX}", team_gid,
         )
 
-        self._populate_staff_roster(client, dispatch_project_id, data.get("staff_roster") or {})
-
         self.config_store.create_team(
             team_id, team_name,
             status="active",
             workspace_gid=workspace_gid,
             asana_team_gid=team_gid,
             asana_token=data["asana_token"],
-            asana_project_ids=dispatch_project_id,
+            asana_project_ids=",".join(dispatch_project_ids),
             asana_database_project_id=database_project_id,
             asana_odometer_project_id=odometer_project_id,
             factor_session_token=data.get("factor_session_token"),
@@ -87,6 +97,34 @@ class Provisioner:
             client.add_enum_option(config["staff_id_field_gid"], f"#{code}")
             client.add_enum_option(config["staff_history_field_gid"], f"{first_name.title()} {code}")
 
+    def add_staff_roster_entry(self, team_id, first_name, code):
+        """Add one new person to a team's Staff ID roster after the fact -
+        see control_bot/router.py's "Staff Roster" menu. Unlike
+        _populate_staff_roster (called once, at provisioning, against an
+        empty field), this must add the Asana enum option to every one of
+        the team's dispatch boards' own Staff ID/Staff ID History fields
+        (each board has its own separate fields - see provision_team), and
+        must only ever add genuinely new/changed entries: add_enum_option
+        has no dedup of its own, so re-adding an unchanged existing name
+        would create a duplicate dropdown option every time this runs.
+        Returns the updated roster dict."""
+        team = self.config_store.get_team(team_id)
+        roster = dict(team.get("staff_roster") or {})
+        key = first_name.strip().lower()
+        if roster.get(key) == code:
+            return roster  # no real change - nothing to add anywhere
+
+        roster[key] = code
+        self.config_store.update_team(team_id, staff_roster=roster)
+
+        client = asana_client.AsanaClient(team["asana_token"], [], self.logger)
+        project_ids = [p.strip() for p in team["asana_project_ids"].split(",") if p.strip()]
+        for project_id in project_ids:
+            config = client._get_project_config(project_id)
+            client.add_enum_option(config["staff_id_field_gid"], f"#{code}")
+            client.add_enum_option(config["staff_history_field_gid"], f"{first_name.title()} {code}")
+        return roster
+
     def rewrite_env(self, team_id):
         """(Re)generate teams/<team_id>/.env from the current config_store
         row - called once at initial provisioning, and again any time
@@ -101,11 +139,13 @@ class Provisioner:
             f"ASANA_TOKEN={team['asana_token']}",
             f"ASANA_PROJECT_IDS={team['asana_project_ids']}",
             f"ASANA_DATABASE_PROJECT_ID={team['asana_database_project_id']}",
-            # Plural: one Odometer Jump project per dispatch board, comma-
-            # separated in the same order as ASANA_PROJECT_IDS. A team
-            # provisioned through the bot has exactly one dispatch board, so
-            # this is a single id (no comma) - see sync.py's main() for how
-            # a team like "original" with 3 dispatch boards uses 3 here.
+            # Plural env var name, but this is always a single shared
+            # Odometer Jump project (bootstrap_odometer_project is only
+            # ever called once per team, regardless of how many dispatch
+            # boards it has) - sync.py's main() maps every dispatch board
+            # to this same one id. See the plan for the alternative (one
+            # Odometer Jump project per dispatch board) "original" briefly
+            # used and reverted from.
             f"ASANA_ODOMETER_PROJECT_IDS={team['asana_odometer_project_id']}",
         ]
         if team.get("factor_session_token"):

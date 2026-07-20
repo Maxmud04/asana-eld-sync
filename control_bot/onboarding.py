@@ -24,11 +24,15 @@ STATE_ASK_LEADER_TENANT = "ASK_LEADER_TENANT"
 STATE_ASK_ASANA_TOKEN = "ASK_ASANA_TOKEN"
 STATE_ASK_WORKSPACE_CHOICE = "ASK_WORKSPACE_CHOICE"
 STATE_ASK_ORG_TEAM_CHOICE = "ASK_ORG_TEAM_CHOICE"
+STATE_ASK_BOARD_NAMES = "ASK_BOARD_NAMES"
 STATE_ASK_STAFF_ROSTER = "ASK_STAFF_ROSTER"
 STATE_CONFIRM = "CONFIRM"
 
 # "David: D195" / "David - D195" / "David, D195" - one staff roster entry
-# per line, name then code, any of a few common separators.
+# per line, name then code, any of a few common separators. Reused by
+# router.py's "Staff Roster" menu (see add_staff_roster_entry) so a new
+# hire later doesn't need a whole new onboarding conversation to parse the
+# same "Name: Code" shape.
 _ROSTER_LINE_PATTERN = re.compile(r"^\s*([A-Za-z][A-Za-z\-' ]*)\s*[:,\-]\s*([A-Za-z0-9#]+)\s*$")
 
 
@@ -84,6 +88,7 @@ class OnboardingManager:
             STATE_ASK_ASANA_TOKEN: self._handle_asana_token,
             STATE_ASK_WORKSPACE_CHOICE: self._handle_workspace_choice,
             STATE_ASK_ORG_TEAM_CHOICE: self._handle_org_team_choice,
+            STATE_ASK_BOARD_NAMES: self._handle_board_names,
             STATE_ASK_STAFF_ROSTER: self._handle_staff_roster,
             STATE_CONFIRM: self._handle_confirm,
         }.get(state)
@@ -225,7 +230,7 @@ class OnboardingManager:
                 )
                 return
         data["asana_team_gid"] = None
-        self._ask_staff_roster(chat_id, data)
+        self._ask_board_names(chat_id, data)
 
     def _handle_org_team_choice(self, chat_id, sender_id, data, text):
         choices = data.get("_org_team_choices", [])
@@ -236,6 +241,27 @@ class OnboardingManager:
             return
         data["asana_team_gid"] = chosen["gid"]
         data.pop("_org_team_choices", None)
+        self._ask_board_names(chat_id, data)
+
+    def _ask_board_names(self, chat_id, data):
+        self._advance(chat_id, STATE_ASK_BOARD_NAMES, data)
+        self.gateway.send_message(
+            chat_id,
+            "How many dispatch boards do you want, and what should each be "
+            "named? Send one board name per line, e.g.:\n"
+            "Texas A\nTexas B\nTexas C\n\n"
+            "Or just send a single name for one board (most teams only "
+            "need one to start - you're not locked in, boards can't be "
+            "renamed later through the bot but ask an admin if you need "
+            "to add more down the line).",
+        )
+
+    def _handle_board_names(self, chat_id, sender_id, data, text):
+        board_names = [line.strip() for line in text.splitlines() if line.strip()]
+        if not board_names:
+            self.gateway.send_message(chat_id, "Please send at least one board name.")
+            return
+        data["dispatch_board_names"] = board_names
         self._ask_staff_roster(chat_id, data)
 
     def _ask_staff_roster(self, chat_id, data):
@@ -265,6 +291,7 @@ class OnboardingManager:
             f"Factor ELD: {'configured' if data.get('factor_session_token') else 'skipped'}\n"
             f"Leader ELD: {'configured' if data.get('leader_session_token') else 'skipped'}\n"
             f"Asana workspace: {data['workspace_gid']}\n"
+            f"Dispatch board(s): {', '.join(data['dispatch_board_names'])}\n"
             f"Staff roster entries: {len(roster)}\n\n"
             "Reply /confirm to create your boards now, or /cancel to start over."
         )
