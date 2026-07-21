@@ -345,28 +345,39 @@ STAFF_ID_BY_FIRST_NAME = {
 # Any commit editor whose name starts with "ALGO" (e.g. "ALGO SERVICE C TX",
 # "ALGO CENTRAL Texas", "ALGO SERVICE BB") is a shared/admin account, not an
 # individual staff member with their own code - all of these collapse to
-# one label, confirmed directly.
+# one label, confirmed directly for team "original" (Texas). This is NOT a
+# generic default for every team - it's specifically Texas's own label, and
+# is only ever used as an explicit default by sync.py's legacy single-team
+# main() (which only ever serves Texas). Every other team gets its own
+# algo_label passed in explicitly (see control_bot's "Staff Roster" ->
+# "Set Commit Label", stored as config_store's algo_service_account_label) -
+# a team with none configured gets NO label at all (see below), not this
+# one - silently reusing Texas's label for every team was a real bug,
+# confirmed live on team "missouri".
 ALGO_SERVICE_ACCOUNT_LABEL = "Texas C"
 
 
 def _resolve_staff_editor(edited_by_name, logger, staff_roster=None, algo_label=None):
     """Match a commit's edited_by_name against a known staff list. Returns
     (staff_id, display_name) - e.g. ("J475", "Joel J475"), or (None,
-    algo_label) for any shared "ALGO ..." account - or None if the editor
-    isn't recognized at all. Never guesses at an ID for an unrecognized
-    name - leaves it for sync.py/asana_client.py to skip.
+    algo_label) for any shared "ALGO ..." account this team has its own
+    label configured for - or None if the editor isn't recognized at all
+    (including an "ALGO ..." editor when this team has no algo_label of its
+    own - see module docstring above). Never guesses at an ID for an
+    unrecognized name - leaves it for sync.py/asana_client.py to skip.
 
-    staff_roster/algo_label default to this team's own
-    STAFF_ID_BY_FIRST_NAME/ALGO_SERVICE_ACCOUNT_LABEL, but a caller (e.g. a
-    different team's own roster) can pass its own instead."""
+    staff_roster defaults to this team's own STAFF_ID_BY_FIRST_NAME, but a
+    caller (e.g. a different team's own roster) can pass its own instead.
+    algo_label has NO such shared default - see above."""
     staff_roster = STAFF_ID_BY_FIRST_NAME if staff_roster is None else staff_roster
-    algo_label = ALGO_SERVICE_ACCOUNT_LABEL if algo_label is None else algo_label
     if not edited_by_name:
         return None
     cleaned = edited_by_name.strip()
     first_word = cleaned.split()[0].lower() if cleaned else ""
 
     if first_word == "algo":
+        if not algo_label:
+            return None  # this team has no commit label configured - leave it blank, same as any other unrecognized editor
         return None, algo_label
 
     staff_id = staff_roster.get(first_word)

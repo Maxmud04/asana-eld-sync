@@ -92,7 +92,7 @@ class TeamRouter:
                 self.gateway.send_message(chat_id, "Send /start to onboard your team first.")
             else:
                 self.gateway.send_buttons(
-                    chat_id, self._main_menu_text(chat_id, team_id), self._main_menu_buttons(chat_id), columns=1,
+                    chat_id, self._main_menu_text(chat_id, team_id), self._main_menu_buttons(chat_id, team_id), columns=1,
                 )
             return
 
@@ -114,6 +114,10 @@ class TeamRouter:
                 # Always legitimate - only ever created for an already-
                 # registered team (see _prompt_staff_roster_add).
                 self._handle_staff_add_reply(chat_id, data, raw_text)
+            elif state == "AWAITING_COMMIT_LABEL":
+                # Always legitimate - only ever created for an already-
+                # registered team (see _prompt_commit_label).
+                self._handle_commit_label_reply(chat_id, data, raw_text)
             else:
                 # A chat that already administers other teams can
                 # legitimately be mid-onboarding for one MORE (see "Add
@@ -173,8 +177,18 @@ class TeamRouter:
             return f"Main Menu (Team: {team['team_name']}):"
         return MAIN_MENU_TEXT
 
-    def _main_menu_buttons(self, chat_id):
+    def _main_menu_buttons(self, chat_id, team_id=None):
         buttons = list(MAIN_MENU_BUTTONS)
+        if team_id is not None:
+            # Every team controls its own sync directly from the main menu
+            # - not just via the hidden /pause and /resume text commands
+            # (which still work too, unchanged). Label reflects current
+            # status so it's always the single correct next action.
+            team = self.config_store.get_team(team_id)
+            if team["status"] == "paused":
+                buttons.append(("▶️ Resume Sync", "menu:resume"))
+            else:
+                buttons.append(("⏸ Pause Sync", "menu:pause"))
         buttons.append(("Add Another Team", "menu:addteam"))
         if len(self.config_store.team_ids_for_chat(chat_id)) > 1:
             buttons.append(("Switch Team", "menu:switchteam"))
@@ -235,7 +249,7 @@ class TeamRouter:
             # the primary control surface; slash-commands above still work
             # as shortcuts for anyone used to them.
             self.gateway.send_buttons(
-                chat_id, self._main_menu_text(chat_id, team_id), self._main_menu_buttons(chat_id), columns=1,
+                chat_id, self._main_menu_text(chat_id, team_id), self._main_menu_buttons(chat_id, team_id), columns=1,
             )
 
     def _truck_counts_text(self, team_id):
@@ -329,7 +343,7 @@ class TeamRouter:
             # a token paste after tapping Back instead of /cancel.
             self.config_store.clear_onboarding_session(chat_id)
             self.gateway.edit_message_text(
-                chat_id, message_id, self._main_menu_text(chat_id, team_id), buttons=self._main_menu_buttons(chat_id),
+                chat_id, message_id, self._main_menu_text(chat_id, team_id), buttons=self._main_menu_buttons(chat_id, team_id),
             )
         elif action == "companyassign":
             self._show_menu_create_section_boards(chat_id, message_id, team_id)
@@ -352,6 +366,18 @@ class TeamRouter:
             self._show_menu_staff_roster(chat_id, message_id, team_id)
         elif action == "staffroster:add":
             self._prompt_staff_roster_add(chat_id, message_id, team_id)
+        elif action == "staffroster:setlabel":
+            self._prompt_commit_label(chat_id, message_id, team_id)
+        elif action == "pause":
+            self.config_store.update_team(team_id, status="paused")
+            self.gateway.edit_message_text(
+                chat_id, message_id, "Sync paused.", buttons=self._main_menu_buttons(chat_id, team_id),
+            )
+        elif action == "resume":
+            self.config_store.update_team(team_id, status="active")
+            self.gateway.edit_message_text(
+                chat_id, message_id, "Sync resumed.", buttons=self._main_menu_buttons(chat_id, team_id),
+            )
         else:
             self.logger.warning("Unrecognized menu action: %r", action)
 
@@ -363,7 +389,9 @@ class TeamRouter:
             text = f"Current staff roster:\n{lines}"
         else:
             text = "No staff roster entries yet."
-        buttons = [("Add Person", "menu:staffroster:add"), BACK_BUTTON]
+        commit_label = team.get("algo_service_account_label")
+        text += f"\n\nCommit label for shared/admin logbook edits: {commit_label or '(not set - left blank)'}"
+        buttons = [("Add Person", "menu:staffroster:add"), ("Set Commit Label", "menu:staffroster:setlabel"), BACK_BUTTON]
         self.gateway.edit_message_text(chat_id, message_id, text, buttons=buttons)
 
     def _prompt_staff_roster_add(self, chat_id, message_id, team_id):
@@ -372,6 +400,16 @@ class TeamRouter:
             chat_id, message_id,
             "Send the new person as 'FirstName: Code' (e.g. 'David: D195'), "
             "or /cancel to stop.",
+        )
+
+    def _prompt_commit_label(self, chat_id, message_id, team_id):
+        self.config_store.save_onboarding_session(chat_id, "AWAITING_COMMIT_LABEL", {"team_id": team_id})
+        self.gateway.edit_message_text(
+            chat_id, message_id,
+            "When a driver's logbook was last edited by a shared/admin "
+            "account (not a named staff member), what should Staff ID "
+            "History show for that? Send the label (e.g. your team name), "
+            "or /skip to leave it blank instead, or /cancel to stop.",
         )
 
     def _show_menu_create_section_boards(self, chat_id, message_id, team_id):
@@ -467,6 +505,29 @@ class TeamRouter:
         self.config_store.clear_onboarding_session(chat_id)
         self.gateway.send_buttons(
             chat_id, f"Added '{first_name.title()}: {code}' to the staff roster.", [BACK_BUTTON],
+        )
+
+    def _handle_commit_label_reply(self, chat_id, data, raw_text):
+        text = raw_text.strip()
+        if text.lower() == "/cancel":
+            self.config_store.clear_onboarding_session(chat_id)
+            self.gateway.send_buttons(chat_id, "Cancelled.", [BACK_BUTTON])
+            return
+
+        team_id = data["team_id"]
+        if text.lower() == "/skip":
+            self.config_store.update_team(team_id, algo_service_account_label="")
+            self.config_store.clear_onboarding_session(chat_id)
+            self.gateway.send_buttons(
+                chat_id, "Cleared - shared/admin logbook edits will be left blank.", [BACK_BUTTON],
+            )
+            return
+
+        label = _clean_pasted_value(text)
+        self.config_store.update_team(team_id, algo_service_account_label=label)
+        self.config_store.clear_onboarding_session(chat_id)
+        self.gateway.send_buttons(
+            chat_id, f"Commit label set to '{label}' - takes effect on the next sync cycle.", [BACK_BUTTON],
         )
 
     def _show_menu_switch_team(self, chat_id, message_id):

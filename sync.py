@@ -1094,7 +1094,15 @@ def main():
 
     if args.once:
         logger.info("Running a single sync cycle (--once)...")
-        run_one_cycle(asana, odometer_project_ids_by_dispatch_id=odometer_project_ids_by_dispatch_id)
+        # This standalone path only ever serves team "original" (Texas)
+        # locally - its own commit label is passed explicitly here rather
+        # than relying on a shared fallback inside eld_factor.py, which
+        # would incorrectly apply Texas's label to every other team's
+        # sync (see eld_factor.ALGO_SERVICE_ACCOUNT_LABEL's docstring).
+        run_one_cycle(
+            asana, odometer_project_ids_by_dispatch_id=odometer_project_ids_by_dispatch_id,
+            algo_label=eld_factor.ALGO_SERVICE_ACCOUNT_LABEL,
+        )
         if database_project_id:
             run_database_cycle(asana, database_project_id)
         return
@@ -1148,7 +1156,11 @@ def main():
         if control is not None and control.is_paused():
             logger.info("Sync is paused (via Telegram) - skipping this cycle.")
         else:
-            run_one_cycle(asana, control, odometer_project_ids_by_dispatch_id)
+            # Same reasoning as the --once path above re: algo_label.
+            run_one_cycle(
+                asana, control, odometer_project_ids_by_dispatch_id,
+                algo_label=eld_factor.ALGO_SERVICE_ACCOUNT_LABEL,
+            )
             if database_project_id and (time.time() - last_database_sync) >= DATABASE_SYNC_INTERVAL_SECONDS:
                 run_database_cycle(asana, database_project_id, control)
                 last_database_sync = time.time()
