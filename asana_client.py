@@ -618,17 +618,36 @@ class AsanaClient:
         )
         return section["data"]["gid"]
 
-    def _stage_enum_option(self, custom_fields, field_gid, options, value, project_name, field_label, task_label):
+    def _stage_enum_option(
+        self, custom_fields, field_gid, options, value, project_name, field_label, task_label, auto_create=False,
+    ):
         """Look up value in one enum field's options and, if found, stage it
         into custom_fields for the next PUT. If field_gid is missing (this
         project doesn't have that field) or value is None (nothing to set),
-        does nothing. If value is given but doesn't match any option, logs a
-        warning and leaves the field untouched rather than guessing."""
+        does nothing. If value doesn't match any existing option: with
+        auto_create=False (Violation, Staff ID - both deliberately
+        hand-curated), logs a warning and leaves the field untouched rather
+        than guessing. With auto_create=True (Staff ID History only - see
+        its two call sites), creates the option on the spot instead -
+        Factor/Leader ELD's own commit history already tells us exactly who
+        edited a logbook, so there's nothing to guess at; requiring someone
+        to first hand-register that name via the bot's "Staff Roster" menu
+        before it can ever show up would just be busywork."""
         if not field_gid or value is None:
             return
         option_gid = options.get(value) or options.get(value.strip().lower())
         if option_gid is not None:
             custom_fields[field_gid] = option_gid
+        elif auto_create:
+            option_gid = self.add_enum_option(field_gid, value)
+            options[value] = option_gid
+            options[value.strip().lower()] = option_gid
+            custom_fields[field_gid] = option_gid
+            self.logger.info(
+                "Project '%s': added new %s option '%s' (seen for the first "
+                "time on task '%s').",
+                project_name, field_label, value, task_label,
+            )
         else:
             self.logger.warning(
                 "Project '%s': %s '%s' has no matching dropdown option - "
@@ -676,7 +695,7 @@ class AsanaClient:
         )
         self._stage_enum_option(
             custom_fields, config.get("staff_history_field_gid"), config["staff_history_options"],
-            staff_history, config["name"], "Staff ID History", name,
+            staff_history, config["name"], "Staff ID History", name, auto_create=True,
         )
 
         if custom_fields:
@@ -761,7 +780,7 @@ class AsanaClient:
         ):
             self._stage_enum_option(
                 custom_fields, match["staff_history_field_gid"], match["staff_history_options"],
-                new_staff_history, match["project_name"], "Staff ID History", match["task_title"],
+                new_staff_history, match["project_name"], "Staff ID History", match["task_title"], auto_create=True,
             )
 
         if custom_fields:

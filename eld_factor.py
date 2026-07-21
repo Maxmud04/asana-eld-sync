@@ -359,16 +359,23 @@ ALGO_SERVICE_ACCOUNT_LABEL = "Texas C"
 
 def _resolve_staff_editor(edited_by_name, logger, staff_roster=None, algo_label=None):
     """Match a commit's edited_by_name against a known staff list. Returns
-    (staff_id, display_name) - e.g. ("J475", "Joel J475"), or (None,
-    algo_label) for any shared "ALGO ..." account this team has its own
-    label configured for - or None if the editor isn't recognized at all
-    (including an "ALGO ..." editor when this team has no algo_label of its
-    own - see module docstring above). Never guesses at an ID for an
-    unrecognized name - leaves it for sync.py/asana_client.py to skip.
+    (staff_id, display_name) - e.g. ("J475", "Joel J475") for a roster
+    match, or (None, cleaned) using Factor/Leader ELD's own raw editor name
+    as-is for anyone NOT in the roster - Factor/Leader ELD already tells us
+    exactly who made the edit, so there's nothing to guess at; requiring a
+    name to be hand-registered via the bot's "Staff Roster" menu before it
+    can ever show up in Staff ID History would just be busywork (asana_
+    client.py's _stage_enum_option auto-creates the dropdown option the
+    first time a given name is seen). Only a genuinely empty edited_by_name,
+    or an "ALGO ..." shared account this team has no algo_label configured
+    for, returns bare None (nothing to show at all).
 
     staff_roster defaults to this team's own STAFF_ID_BY_FIRST_NAME, but a
-    caller (e.g. a different team's own roster) can pass its own instead.
-    algo_label has NO such shared default - see above."""
+    caller (e.g. a different team's own roster) can pass its own instead -
+    a roster match still wins when there is one, purely so a known staff
+    member's code (e.g. "J475") is included even on a platform whose own
+    edited_by_name doesn't already embed it. algo_label has no shared
+    default - see module docstring above."""
     staff_roster = STAFF_ID_BY_FIRST_NAME if staff_roster is None else staff_roster
     if not edited_by_name:
         return None
@@ -382,11 +389,9 @@ def _resolve_staff_editor(edited_by_name, logger, staff_roster=None, algo_label=
 
     staff_id = staff_roster.get(first_word)
     if staff_id is None:
-        logger.info(
-            "Factor ELD: commit editor '%s' doesn't match any known staff - "
-            "leaving Staff ID blank.", edited_by_name,
-        )
-        return None
+        # Not in this team's curated roster - still show Factor/Leader
+        # ELD's own editor name directly rather than leaving it blank.
+        return None, cleaned
     # Factor ELD's own name already includes the ID for real staff (e.g.
     # "Joel J475") - use that as-is. Only append it ourselves if somehow
     # missing, so "Staff ID History" always shows the full "Name ID" form.

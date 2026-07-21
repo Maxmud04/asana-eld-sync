@@ -26,12 +26,22 @@ own credentials/state to it every cycle.
 
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import asana_client
 import sync
 import telegram_notifier
 
 logger = logging.getLogger("multi_sync")
+
+# Teams run CONCURRENTLY, not one after another - a large team (e.g. Texas,
+# 1700+ drivers, 15-20+ minutes per cycle) would otherwise block every
+# smaller team from getting its own updates for that whole time, every
+# cycle - confirmed happening repeatedly for real once there was more than
+# one team. Each team has its own AsanaClient/TeamRuntimeState/ELD session,
+# and ConfigStore's own write lock already serializes concurrent writes -
+# see config_store.py - so running these in parallel is safe.
+MAX_PARALLEL_TEAMS = 8
 
 
 class _TeamControl:
@@ -166,16 +176,37 @@ def run_team_cycle(config_store, bot_token, team_id, state, logger):
 
 
 def run_all_teams_once(config_store, bot_token, states_by_team_id, logger):
-    """One pass over every currently-active team. states_by_team_id is
-    mutated in place (new teams get a fresh TeamRuntimeState the first
-    time they're seen) - the caller owns that dict across calls so state
-    persists between cycles."""
+    """One pass over every currently-active team, run CONCURRENTLY (see
+    MAX_PARALLEL_TEAMS above) rather than one after another.
+    states_by_team_id is mutated in place (new teams get a fresh
+    TeamRuntimeState the first time they're seen) - the caller owns that
+    dict across calls so state persists between cycles."""
     teams = config_store.list_teams(status="active")
     logger.info("Multi-team sync cycle: %s active team(s).", len(teams))
-    for team in teams:
-        team_id = team["team_id"]
-        state = states_by_team_id.setdefault(team_id, TeamRuntimeState())
-        run_team_cycle(config_store, bot_token, team_id, state, logger)
+    if not teams:
+        return
+
+    with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_TEAMS, len(teams))) as pool:
+        team_id_by_future = {}
+        for team in teams:
+            team_id = team["team_id"]
+            state = states_by_team_id.setdefault(team_id, TeamRuntimeState())
+            future = pool.submit(run_team_cycle, config_store, bot_token, team_id, state, logger)
+            team_id_by_future[future] = team_id
+
+        for future, team_id in team_id_by_future.items():
+            try:
+                future.result()
+            except Exception:
+                # run_team_cycle already catches its own exceptions
+                # internally - this only ever fires for something that
+                # escaped before/around that (e.g. a config_store read
+                # failing outright) - still must not stop the other
+                # teams' futures from being collected.
+                logger.exception(
+                    "Team '%s': sync cycle raised an unhandled exception outside its own try/except.",
+                    team_id,
+                )
 
 
 def sync_loop_forever(config_store, bot_token, logger, poll_interval_minutes=5):
