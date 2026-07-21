@@ -516,7 +516,7 @@ class TeamRouter:
 
         team_id = data["team_id"]
         if text.lower() == "/skip":
-            self.config_store.update_team(team_id, algo_service_account_label="")
+            self.provisioning.set_commit_label(team_id, "")
             self.config_store.clear_onboarding_session(chat_id)
             self.gateway.send_buttons(
                 chat_id, "Cleared - shared/admin logbook edits will be left blank.", [BACK_BUTTON],
@@ -524,7 +524,7 @@ class TeamRouter:
             return
 
         label = _clean_pasted_value(text)
-        self.config_store.update_team(team_id, algo_service_account_label=label)
+        self.provisioning.set_commit_label(team_id, label)
         self.config_store.clear_onboarding_session(chat_id)
         self.gateway.send_buttons(
             chat_id, f"Commit label set to '{label}' - takes effect on the next sync cycle.", [BACK_BUTTON],

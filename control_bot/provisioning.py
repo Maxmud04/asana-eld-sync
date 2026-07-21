@@ -133,6 +133,30 @@ class Provisioner:
             client.add_enum_option(config["staff_history_field_gid"], f"{first_name.title()} {code}")
         return roster
 
+    def set_commit_label(self, team_id, label):
+        """Set a team's commit label for shared/admin logbook edits (see
+        control_bot/router.py's "Set Commit Label" and eld_factor.py's
+        _resolve_staff_editor) and make sure it actually exists as a Staff
+        ID History dropdown option on every one of the team's dispatch
+        boards - otherwise, same as an unrecognized staff name, Asana would
+        just reject it with "no matching dropdown option" and leave the
+        field blank, silently defeating the whole point of setting one.
+        Passing an empty label clears it - _resolve_staff_editor already
+        treats a falsy label as "leave blank", so no Asana option needs
+        adding for that case."""
+        self.config_store.update_team(team_id, algo_service_account_label=label)
+        if not label:
+            return
+
+        team = self.config_store.get_team(team_id)
+        client = asana_client.AsanaClient(team["asana_token"], [], self.logger)
+        project_ids = [p.strip() for p in team["asana_project_ids"].split(",") if p.strip()]
+        for project_id in project_ids:
+            config = client._get_project_config(project_id)
+            existing = config["staff_history_options"]
+            if label not in existing and label.strip().lower() not in existing:
+                client.add_enum_option(config["staff_history_field_gid"], label)
+
     def rewrite_env(self, team_id):
         """(Re)generate teams/<team_id>/.env from the current config_store
         row - called once at initial provisioning, and again any time
