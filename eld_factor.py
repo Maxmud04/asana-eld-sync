@@ -25,6 +25,7 @@ here.
 """
 
 import os
+import random
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -530,7 +531,15 @@ def _request_with_retries(session, url, params, logger, platform_label="Factor E
                 platform_label, attempt, MAX_RETRIES, exc,
             )
             if attempt < MAX_RETRIES:
-                time.sleep(RETRY_DELAY_SECONDS)
+                # Confirmed live (2026-07-22 Railway logs): when a burst of
+                # ~10 concurrent per-company requests (MAX_PARALLEL_COMPANY_
+                # FETCHES) trips the backend's rate limit, every one of those
+                # threads fails at once and, with a flat delay, retries at
+                # once too - hitting the exact same limit again on attempt
+                # 2/3 and 3/3. Exponential backoff + random jitter spreads
+                # the retries out so they stop re-triggering each other.
+                delay = RETRY_DELAY_SECONDS * (2 ** (attempt - 1))
+                time.sleep(delay + random.uniform(0, delay))
     raise last_error
 
 
