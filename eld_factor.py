@@ -721,10 +721,15 @@ def _dedupe_duplicate_person_records(tagged_raw_drivers, logger, platform_label=
 # Cache of {"company_id":..., "company_name":...} pairs for every company
 # each tenant knows about, so we don't have to rediscover them every single
 # cycle - the list of companies changes rarely, unlike driver statuses.
-# Keyed by tenant_id since Leader ELD is a different tenant on this same
-# backend (confirmed) - without keying by tenant, Leader ELD's cache lookup
-# would incorrectly return Factor ELD's company list (or vice versa,
-# whichever tenant happened to populate the cache first).
+# Keyed by (tenant_id, session_token) - confirmed live (2026-07-22) that two
+# teams sharing the exact same tenant_id (Texas and Missouri) can still have
+# genuinely different company visibility per their own session token (Texas's
+# token sees 19 companies including KARAHAN LOGISTICS LLC; Missouri's token
+# sees 60 completely different ones, zero overlap). Keying by tenant_id alone
+# let whichever team's thread ran first silently overwrite the other team's
+# view for up to COMPANY_CACHE_TTL_SECONDS - Texas's real companies would
+# vanish from its own sync for up to 30 minutes at a time whenever Missouri's
+# concurrent cycle (see multi_sync.py's team-level concurrency) raced ahead.
 _company_cache = {}
 COMPANY_CACHE_TTL_SECONDS = 1800  # 30 minutes
 
@@ -739,7 +744,8 @@ def _discover_companies(session, logger, tenant_id, platform_label="Factor ELD")
     accuracy (which is why driver data itself is always fetched per-company
     instead, below)."""
     now = time.time()
-    cache_entry = _company_cache.get(tenant_id)
+    cache_key = (tenant_id, session.headers.get("Authorization", ""))
+    cache_entry = _company_cache.get(cache_key)
     if cache_entry is not None and (now - cache_entry["fetched_at"]) < COMPANY_CACHE_TTL_SECONDS:
         return cache_entry["companies"]
 
@@ -754,7 +760,7 @@ def _discover_companies(session, logger, tenant_id, platform_label="Factor ELD")
             seen[company_id] = raw.get("company_name")
     companies = [{"company_id": cid, "company_name": name} for cid, name in seen.items()]
 
-    _company_cache[tenant_id] = {"companies": companies, "fetched_at": now}
+    _company_cache[cache_key] = {"companies": companies, "fetched_at": now}
     logger.info("%s: discovered %s companies.", platform_label, len(companies))
     return companies
 
