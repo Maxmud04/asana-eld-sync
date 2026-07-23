@@ -313,6 +313,75 @@ def _check_token_expiry_warning(control, factor_token=None, leader_token=None, s
     _check_one_token_expiry(control, "LEADER_SESSION_TOKEN", "Leader ELD", leader_token, state)
 
 
+# How far back an HOS Audit Transfer entry's own created_at can be and still
+# trigger an alert - keeps a brand-new team (or one recovering from a gap in
+# coverage) from getting flooded with a Telegram message for every
+# historical DOT inspection the moment this check first sees it, the same
+# reasoning eld_factor.VIOLATION_LOOKBACK_DAYS uses for stale violations.
+FMCSA_ALERT_LOOKBACK_DAYS = 2
+
+
+def check_fmcsa_transfers(
+    control, seen_checker, mark_seen,
+    factor_session_token=None, factor_tenant_id=None, factor_company_filter=None,
+    leader_session_token=None, leader_tenant_id=None,
+):
+    """Send one Telegram alert per HOS Audit Transfer log entry (a DOT
+    roadside inspector transferring/auditing a driver's e-logs - see
+    eld_factor.fetch_fmcsa_transfers) that's both recent (see
+    FMCSA_ALERT_LOOKBACK_DAYS) and genuinely new (seen_checker/mark_seen let
+    the caller - multi_sync.py - back "already alerted" with config_store's
+    per-team persistent table, so a restart doesn't repeat old alerts).
+    Does nothing if control is None (no Telegram to alert through)."""
+    if control is None:
+        return
+
+    entries = []
+    try:
+        entries.extend(eld_factor.fetch_fmcsa_transfers(
+            logger, session_token=factor_session_token, tenant_id=factor_tenant_id,
+            company_filter=factor_company_filter,
+        ))
+    except Exception:
+        logger.exception("Factor ELD: failed to check HOS Audit Transfer history this run.")
+
+    try:
+        entries.extend(eld_leader.fetch_fmcsa_transfers(
+            logger, session_token=leader_session_token, tenant_id=leader_tenant_id,
+        ))
+    except Exception:
+        logger.exception("Leader ELD: failed to check HOS Audit Transfer history this run.")
+
+    now = datetime.now(timezone.utc)
+    for entry in entries:
+        log_id = entry.get("id")
+        if not log_id or seen_checker(log_id):
+            continue
+
+        created_at = entry.get("created_at")
+        if created_at:
+            try:
+                created_dt = datetime.strptime(created_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                if (now - created_dt).days > FMCSA_ALERT_LOOKBACK_DAYS:
+                    mark_seen(log_id)  # old - note it as seen without alerting, never revisit it
+                    continue
+            except ValueError:
+                pass  # unparseable date - fall through and alert anyway rather than silently drop it
+
+        mark_seen(log_id)
+        period = f"{(entry.get('start_date') or '?')[:10]} to {(entry.get('end_date') or '?')[:10]}"
+        message = (
+            f"🚨 DOT inspector transferred a logbook: "
+            f"{entry.get('driver_name') or 'Unknown driver'} "
+            f"({entry.get('company_name') or 'unknown company'})\n"
+            f"Period: {period}\n"
+            f"Status: {entry.get('file_status') or 'unknown'}"
+        )
+        if entry.get("comment"):
+            message += f"\nComment: {entry['comment']}"
+        control.notify_all(message)
+
+
 def _sync_odometer_board(
     asana, odometer_project_ids_by_dispatch_id, logger, section_index,
     factor_session_token=None, factor_tenant_id=None,

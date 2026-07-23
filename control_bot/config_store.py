@@ -99,6 +99,19 @@ CREATE TABLE IF NOT EXISTS pending_companies (
 );
 """
 
+# Which HOS Audit Transfer log entries (DOT inspector logbook transfers -
+# see sync.py's check_fmcsa_transfers) a team has already been alerted about
+# over Telegram, so a redeploy/restart doesn't re-alert on the same old
+# inspection every time.
+_SCHEMA_SEEN_FMCSA_TRANSFERS = """
+CREATE TABLE IF NOT EXISTS seen_fmcsa_transfers (
+    team_id TEXT NOT NULL,
+    log_id TEXT NOT NULL,
+    seen_at TEXT NOT NULL,
+    PRIMARY KEY (team_id, log_id)
+);
+"""
+
 # Fields whose value is stored encrypted (as "<field>_enc") rather than
 # plaintext - see _prepare_row/_decode_team_row.
 _ENCRYPTED_FIELDS = {"asana_token", "factor_session_token", "leader_session_token"}
@@ -138,6 +151,7 @@ class ConfigStore:
             self._migrate_team_admins(conn)
             conn.executescript(_SCHEMA_CHAT_ACTIVE_TEAM)
             conn.executescript(_SCHEMA_PENDING_COMPANIES)
+            conn.executescript(_SCHEMA_SEEN_FMCSA_TRANSFERS)
 
     def _migrate_team_admins(self, conn):
         """Create team_admins fresh (new composite-PK shape) if it doesn't
@@ -349,3 +363,20 @@ class ConfigStore:
                 (team_id, pending_id),
             )
         return entry
+
+    # ---------- HOS Audit Transfer alerts ----------
+
+    def has_seen_fmcsa_transfer(self, team_id, log_id):
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM seen_fmcsa_transfers WHERE team_id = ? AND log_id = ?",
+                (team_id, log_id),
+            ).fetchone()
+        return row is not None
+
+    def mark_fmcsa_transfer_seen(self, team_id, log_id):
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO seen_fmcsa_transfers (team_id, log_id, seen_at) VALUES (?, ?, ?)",
+                (team_id, log_id, _now()),
+            )

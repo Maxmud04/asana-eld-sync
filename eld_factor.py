@@ -74,6 +74,17 @@ COMMITS_API_BASE = "https://api.drivehos.app/api/v1/commits"
 # "inactive" drivers have to be fetched as two separate calls.
 DRIVERS_LIST_API_BASE = "https://api.drivehos.app/api/v1/drivers"
 DRIVERS_LIST_STATUSES = ("active", "inactive")
+# Returns roadside-inspector logbook transfer history ("Compliance > HOS
+# Audit Transfer" in the dashboard - a DOT inspector "transferring"/auditing
+# a driver's e-logs). Confirmed via DevTools (2026-07-23): scoped by the
+# same Company_id header the per-company driver list uses, paginated with
+# page/limit, returning {"data": {"logs": [{"id", "driver_name",
+# "company_name", "start_date", "end_date", "file_status", "comment", ...
+# "created_at"}, ...]}}. Only fetched one page at a time (see
+# fetch_fmcsa_transfers) since we only care about detecting brand-new
+# transfers, not the full historical log.
+FMCSA_API_BASE = "https://api.drivehos.app/api/v1/fmcsa/company"
+FMCSA_PAGE_SIZE = 20
 PAGE_SIZE = 100  # how many drivers to ask for per page
 MAX_RETRIES = 3
 RETRY_DELAY_SECONDS = 2
@@ -469,6 +480,80 @@ def fetch_staff_editors(driver_ids, logger, session_token=None, tenant_id=None,
                 )
                 results[driver_id] = None
     return results
+
+
+def _fetch_fmcsa_logs_for_company(session_headers, company_id, logger, platform_label="Factor ELD"):
+    """Return every HOS Audit Transfer log entry Factor/Leader ELD has for
+    one company, most-recent first (confirmed by the dashboard's own
+    behavior - the first page always showed today's newest transfer at the
+    top). Only page 1 - see fetch_fmcsa_transfers for why the full history
+    isn't needed."""
+    scoped_session = requests.Session()
+    scoped_session.headers.update(session_headers)
+    scoped_session.headers["Company_id"] = company_id
+    body = _request_with_retries(
+        scoped_session, FMCSA_API_BASE,
+        {"page": 1, "limit": FMCSA_PAGE_SIZE}, logger, platform_label,
+    )
+    return body.get("data", {}).get("logs", [])
+
+
+def fetch_fmcsa_transfers(logger, session_token=None, tenant_id=None, platform_label="Factor ELD",
+                            apply_company_filter=True, company_filter=None):
+    """Return every company's recent HOS Audit Transfer log entries (raw
+    dicts straight from the API, untouched - see _fetch_fmcsa_logs_for_company
+    for the confirmed shape) across every company this token can see.
+    Callers (see sync.py's check_fmcsa_transfers) match on each entry's own
+    "id" field to find ones they haven't alerted about yet - this function
+    itself has no notion of "new", just "currently visible".
+
+    session_token/tenant_id/apply_company_filter/company_filter behave
+    exactly like fetch_drivers' own params (same per-team override pattern),
+    since this reuses the same company discovery and per-company fetch
+    machinery."""
+    session_token = session_token or os.environ.get("FACTOR_SESSION_TOKEN", "")
+    tenant_id = tenant_id or os.environ.get("FACTOR_TENANT_ID", "")
+    if not session_token or not tenant_id:
+        return []
+
+    company_filter = _get_company_filter(company_filter) if apply_company_filter else None
+
+    session = requests.Session()
+    session.headers.update({
+        "Authorization": f"Bearer {session_token}",
+        "Tenant_id": tenant_id,
+    })
+
+    if company_filter is not None and len(company_filter) == 1:
+        companies_to_fetch = [{"company_id": company_filter[0], "company_name": None}]
+    else:
+        companies_to_fetch = _discover_companies(session, logger, tenant_id, platform_label)
+        if company_filter is not None:
+            normalized_filter = {_normalize_id(c) for c in company_filter}
+            companies_to_fetch = [
+                c for c in companies_to_fetch
+                if _normalize_id(c["company_id"]) in normalized_filter
+            ]
+
+    all_logs = []
+    with ThreadPoolExecutor(max_workers=MAX_PARALLEL_COMPANY_FETCHES) as pool:
+        future_to_company = {
+            pool.submit(
+                _fetch_fmcsa_logs_for_company, session.headers, company["company_id"], logger, platform_label,
+            ): company
+            for company in companies_to_fetch
+        }
+        for future in as_completed(future_to_company):
+            company = future_to_company[future]
+            try:
+                all_logs.extend(future.result())
+            except Exception:
+                logger.exception(
+                    "%s: failed to check HOS Audit Transfer history for company "
+                    "'%s' - skipping it this run.",
+                    platform_label, company.get("company_name") or company["company_id"],
+                )
+    return all_logs
 
 
 def _normalize_id(value):

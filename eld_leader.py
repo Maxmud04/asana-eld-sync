@@ -99,3 +99,20 @@ def fetch_staff_editors(driver_ids, logger, session_token=None, tenant_id=None, 
         driver_ids, logger, session_token, tenant_id, platform_label="Leader ELD",
         staff_roster=staff_roster, algo_label=algo_label,
     )
+
+
+def fetch_fmcsa_transfers(logger, session_token=None, tenant_id=None):
+    """Return Leader ELD's own recent HOS Audit Transfer log entries (DOT
+    inspector logbook transfers) - same confirmed endpoint Factor ELD uses,
+    same backend, just this tenant's own credentials. See
+    eld_factor.fetch_fmcsa_transfers for the confirmed shape.
+
+    session_token/tenant_id default to this process's own .env credentials,
+    but can be overridden - see fetch_drivers() above."""
+    session_token, tenant_id = _leader_credentials(logger, session_token, tenant_id)
+    if session_token is None:
+        return []
+    return eld_factor.fetch_fmcsa_transfers(
+        logger, session_token=session_token, tenant_id=tenant_id, platform_label="Leader ELD",
+        apply_company_filter=False,
+    )

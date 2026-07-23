@@ -156,6 +156,17 @@ def run_team_cycle(config_store, bot_token, team_id, state, logger):
             algo_label=team.get("algo_service_account_label") or None,
         )
 
+        sync.check_fmcsa_transfers(
+            control,
+            seen_checker=lambda log_id: config_store.has_seen_fmcsa_transfer(team_id, log_id),
+            mark_seen=lambda log_id: config_store.mark_fmcsa_transfer_seen(team_id, log_id),
+            factor_session_token=team.get("factor_session_token"),
+            factor_tenant_id=team.get("factor_tenant_id"),
+            factor_company_filter=team.get("factor_company_filter"),
+            leader_session_token=team.get("leader_session_token"),
+            leader_tenant_id=team.get("leader_tenant_id"),
+        )
+
         database_project_id = team.get("asana_database_project_id")
         if database_project_id and (
             time.time() - state.last_database_sync >= sync.DATABASE_SYNC_INTERVAL_SECONDS
