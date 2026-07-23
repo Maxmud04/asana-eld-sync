@@ -369,16 +369,12 @@ def check_fmcsa_transfers(
                 pass  # unparseable date - fall through and alert anyway rather than silently drop it
 
         mark_seen(log_id)
-        period = f"{(entry.get('start_date') or '?')[:10]} to {(entry.get('end_date') or '?')[:10]}"
         message = (
-            f"🚨 DOT inspector transferred a logbook: "
-            f"{entry.get('driver_name') or 'Unknown driver'} "
-            f"({entry.get('company_name') or 'unknown company'})\n"
-            f"Period: {period}\n"
-            f"Status: {entry.get('file_status') or 'unknown'}"
+            f"🚨 DOT inspection\n\n"
+            f"Company: {entry.get('company_name') or 'unknown company'}\n"
+            f"Driver: {entry.get('driver_name') or 'Unknown driver'}\n\n"
+            f"Status: transferred 🚛"
         )
-        if entry.get("comment"):
-            message += f"\nComment: {entry['comment']}"
         control.notify_all(message)
 
 
