@@ -68,6 +68,16 @@ def main():
         )
         sync_thread.start()
         logger.info("Multi-team sync loop started (every %s minute(s)).", poll_interval_minutes)
+
+        fmcsa_interval_seconds = float(os.environ.get("FMCSA_CHECK_INTERVAL_SECONDS", "30"))
+        fmcsa_logger = logging.getLogger("multi_sync.fmcsa")
+        fmcsa_thread = threading.Thread(
+            target=multi_sync.fmcsa_check_loop_forever,
+            args=(config_store, bot_token, fmcsa_logger, fmcsa_interval_seconds),
+            daemon=True,
+        )
+        fmcsa_thread.start()
+        logger.info("HOS Audit Transfer check loop started (every %s second(s)).", fmcsa_interval_seconds)
     else:
         logger.info("MULTI_SYNC_ENABLED=false - bot only, no sync loop in this process.")
 

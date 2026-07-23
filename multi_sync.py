@@ -156,17 +156,6 @@ def run_team_cycle(config_store, bot_token, team_id, state, logger):
             algo_label=team.get("algo_service_account_label") or None,
         )
 
-        sync.check_fmcsa_transfers(
-            control,
-            seen_checker=lambda log_id: config_store.has_seen_fmcsa_transfer(team_id, log_id),
-            mark_seen=lambda log_id: config_store.mark_fmcsa_transfer_seen(team_id, log_id),
-            factor_session_token=team.get("factor_session_token"),
-            factor_tenant_id=team.get("factor_tenant_id"),
-            factor_company_filter=team.get("factor_company_filter"),
-            leader_session_token=team.get("leader_session_token"),
-            leader_tenant_id=team.get("leader_tenant_id"),
-        )
-
         database_project_id = team.get("asana_database_project_id")
         if database_project_id and (
             time.time() - state.last_database_sync >= sync.DATABASE_SYNC_INTERVAL_SECONDS
@@ -233,3 +222,70 @@ def sync_loop_forever(config_store, bot_token, logger, poll_interval_minutes=5):
         except Exception:
             logger.exception("Multi-team sync loop: unexpected top-level error this cycle.")
         time.sleep(interval_seconds)
+
+
+def _check_one_team_fmcsa(config_store, bot_token, team_id, logger):
+    """One team's own HOS Audit Transfer check - no AsanaClient/dispatch-
+    board dependency at all (see sync.check_fmcsa_transfers), which is why
+    this runs on its own much faster loop below rather than piggybacking on
+    the 5-minute dispatch cycle."""
+    team = config_store.get_team(team_id)
+    if team is None or team.get("status") != "active":
+        return
+    chat_ids = config_store.chat_ids_for_team(team_id)
+    control = _TeamControl(bot_token, chat_ids, config_store, team_id, logger)
+    if control.is_paused():
+        return
+    sync.check_fmcsa_transfers(
+        control,
+        seen_checker=lambda log_id: config_store.has_seen_fmcsa_transfer(team_id, log_id),
+        mark_seen=lambda log_id: config_store.mark_fmcsa_transfer_seen(team_id, log_id),
+        factor_session_token=team.get("factor_session_token"),
+        factor_tenant_id=team.get("factor_tenant_id"),
+        factor_company_filter=team.get("factor_company_filter"),
+        leader_session_token=team.get("leader_session_token"),
+        leader_tenant_id=team.get("leader_tenant_id"),
+    )
+
+
+def run_fmcsa_check_once(config_store, bot_token, logger):
+    """One pass over every active team's HOS Audit Transfer check, run
+    concurrently (same reasoning as run_all_teams_once)."""
+    teams = config_store.list_teams(status="active")
+    if not teams:
+        return
+    with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_TEAMS, len(teams))) as pool:
+        team_id_by_future = {
+            pool.submit(_check_one_team_fmcsa, config_store, bot_token, team["team_id"], logger): team["team_id"]
+            for team in teams
+        }
+        for future, team_id in team_id_by_future.items():
+            try:
+                future.result()
+            except Exception:
+                logger.exception(
+                    "Team '%s': HOS Audit Transfer check raised an unhandled exception outside "
+                    "its own try/except.", team_id,
+                )
+
+
+def fmcsa_check_loop_forever(config_store, bot_token, logger, poll_interval_seconds=30):
+    """Runs forever, checking every active team's HOS Audit Transfer history
+    every poll_interval_seconds - deliberately its own separate, much faster
+    loop from sync_loop_forever's 5-minute dispatch cycle, since a
+    roadside-inspector transfer alert is time-sensitive in a way status
+    updates aren't. Kept well above ~10s on purpose: a full pass already
+    means one request per company (~130+ for Texas alone, Factor + Leader
+    combined) at MAX_PARALLEL_COMPANY_FETCHES concurrency, which itself
+    takes on the order of 10-15 seconds - polling faster than that would
+    mean back-to-back passes with no rest, which is exactly what caused the
+    403 rate-limit storms the regular dispatch sync had to add backoff for
+    (see eld_factor.py's _request_with_retries). 30s leaves real breathing
+    room while still alerting far faster than the 5-minute dispatch cycle."""
+    logger.info("HOS Audit Transfer check loop starting - running every %s second(s).", poll_interval_seconds)
+    while True:
+        try:
+            run_fmcsa_check_once(config_store, bot_token, logger)
+        except Exception:
+            logger.exception("HOS Audit Transfer check loop: unexpected top-level error this cycle.")
+        time.sleep(poll_interval_seconds)
