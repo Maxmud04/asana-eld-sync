@@ -373,7 +373,7 @@ def check_fmcsa_transfers(
             f"🚨 DOT inspection\n\n"
             f"Company: {entry.get('company_name') or 'unknown company'}\n"
             f"Driver: {entry.get('driver_name') or 'Unknown driver'}\n\n"
-            f"Status: transferred 🚛"
+            f"Status: transferred 🚚"
         )
         control.notify_all(message)
 
