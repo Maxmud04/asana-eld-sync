@@ -20,6 +20,19 @@ import asana_client
 
 _logger = logging.getLogger("control_bot.provisioning")
 
+
+def _all_dispatch_project_ids(team):
+    """Every dispatch board id a team has, across BOTH board groups when a
+    second one exists (see config_store's asana_project_ids_2, sync.py's
+    run_one_cycle asana_2 param) - so a Staff ID roster addition or commit
+    label shows up on every board a driver could land on, not just the
+    first/primary group. Empty/absent asana_project_ids_2 (every team
+    except one with a second board group configured) contributes nothing,
+    unchanged from before this existed."""
+    ids = [p.strip() for p in (team.get("asana_project_ids") or "").split(",") if p.strip()]
+    ids += [p.strip() for p in (team.get("asana_project_ids_2") or "").split(",") if p.strip()]
+    return ids
+
 # One dispatch board to start - the data model (a variable-length
 # comma-separated ASANA_PROJECT_IDS list) already supports more; a team can
 # get a 2nd/3rd added later without any new plumbing, see the plan.
@@ -126,8 +139,7 @@ class Provisioner:
         self.config_store.update_team(team_id, staff_roster=roster)
 
         client = asana_client.AsanaClient(team["asana_token"], [], self.logger)
-        project_ids = [p.strip() for p in team["asana_project_ids"].split(",") if p.strip()]
-        for project_id in project_ids:
+        for project_id in _all_dispatch_project_ids(team):
             config = client._get_project_config(project_id)
             client.add_enum_option(config["staff_id_field_gid"], f"#{code}")
             client.add_enum_option(config["staff_history_field_gid"], f"{first_name.title()} {code}")
@@ -150,8 +162,7 @@ class Provisioner:
 
         team = self.config_store.get_team(team_id)
         client = asana_client.AsanaClient(team["asana_token"], [], self.logger)
-        project_ids = [p.strip() for p in team["asana_project_ids"].split(",") if p.strip()]
-        for project_id in project_ids:
+        for project_id in _all_dispatch_project_ids(team):
             config = client._get_project_config(project_id)
             existing = config["staff_history_options"]
             if label not in existing and label.strip().lower() not in existing:

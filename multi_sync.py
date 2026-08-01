@@ -81,6 +81,12 @@ class TeamRuntimeState:
         self.asana_token = None  # the token asana_client was built with
         self.token_state = sync.TokenAlertState()
         self.last_database_sync = 0.0
+        # Second, independent set of dispatch boards covering the same
+        # company/driver list (see sync.run_one_cycle's asana_2 param) -
+        # None for every team that hasn't been given a second board group
+        # (config_store's asana_project_ids_2 column is NULL for them).
+        self.asana_client_2 = None
+        self.asana_project_ids_2 = None  # project_ids_2 asana_client_2 was built with
 
 
 def _build_odometer_mapping(project_ids, odometer_ids_raw):
@@ -121,6 +127,20 @@ def run_team_cycle(config_store, bot_token, team_id, state, logger):
         state.asana_client = asana_client.AsanaClient(team["asana_token"], project_ids, logger)
         state.asana_token = team["asana_token"]
 
+    project_ids_2_raw = team.get("asana_project_ids_2")
+    project_ids_2 = [p.strip() for p in (project_ids_2_raw or "").split(",") if p.strip()]
+    if project_ids_2:
+        if (
+            state.asana_client_2 is None
+            or state.asana_project_ids_2 != project_ids_2
+            or state.asana_token != team["asana_token"]
+        ):
+            state.asana_client_2 = asana_client.AsanaClient(team["asana_token"], project_ids_2, logger)
+            state.asana_project_ids_2 = project_ids_2
+    else:
+        state.asana_client_2 = None
+        state.asana_project_ids_2 = None
+
     odometer_raw = team.get("asana_odometer_project_id")
     odometer_mapping = _build_odometer_mapping(project_ids, odometer_raw)
     if odometer_raw and odometer_mapping is None:
@@ -154,6 +174,7 @@ def run_team_cycle(config_store, bot_token, team_id, state, logger):
             leader_tenant_id=team.get("leader_tenant_id"),
             staff_roster=team.get("staff_roster"),
             algo_label=team.get("algo_service_account_label") or None,
+            asana_2=state.asana_client_2,
         )
 
         database_project_id = team.get("asana_database_project_id")

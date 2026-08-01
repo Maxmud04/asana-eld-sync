@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS teams (
     asana_team_gid TEXT,
     asana_token_enc BLOB,
     asana_project_ids TEXT,
+    asana_project_ids_2 TEXT,
     asana_database_project_id TEXT,
     asana_odometer_project_id TEXT,
     factor_session_token_enc BLOB,
@@ -112,6 +113,13 @@ CREATE TABLE IF NOT EXISTS seen_fmcsa_transfers (
 );
 """
 
+# New `teams` columns added after the table already had live rows in
+# production - see _migrate_team_columns. NULL by default for every
+# existing team (nothing writes to a team's row unless asked to).
+_NEW_TEAM_COLUMNS = {
+    "asana_project_ids_2": "TEXT",
+}
+
 # Fields whose value is stored encrypted (as "<field>_enc") rather than
 # plaintext - see _prepare_row/_decode_team_row.
 _ENCRYPTED_FIELDS = {"asana_token", "factor_session_token", "leader_session_token"}
@@ -149,9 +157,20 @@ class ConfigStore:
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
             self._migrate_team_admins(conn)
+            self._migrate_team_columns(conn)
             conn.executescript(_SCHEMA_CHAT_ACTIVE_TEAM)
             conn.executescript(_SCHEMA_PENDING_COMPANIES)
             conn.executescript(_SCHEMA_SEEN_FMCSA_TRANSFERS)
+
+    def _migrate_team_columns(self, conn):
+        """Add any new nullable `teams` column that doesn't exist yet on an
+        already-running production DB - `CREATE TABLE IF NOT EXISTS` alone
+        only helps a brand-new install, it does nothing for a table that
+        already exists with real rows in it (Texas/Missouri)."""
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(teams)").fetchall()}
+        for column, column_type in _NEW_TEAM_COLUMNS.items():
+            if column not in existing:
+                conn.execute(f"ALTER TABLE teams ADD COLUMN {column} {column_type}")
 
     def _migrate_team_admins(self, conn):
         """Create team_admins fresh (new composite-PK shape) if it doesn't

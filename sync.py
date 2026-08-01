@@ -506,71 +506,31 @@ def _sync_one_odometer_project(asana, odometer_project_id, issues, logger):
         logger.exception("Odometer Jump board: failed to clean up empty company sections.")
 
 
-def run_one_cycle(
-    asana, control=None, odometer_project_ids_by_dispatch_id=None,
-    token_state=None,
-    factor_session_token=None, factor_tenant_id=None, factor_company_filter=None,
-    leader_session_token=None, leader_tenant_id=None,
-    staff_roster=None, algo_label=None,
+def _sync_dispatch_board_group(
+    asana, task_index, fallback_index, combined_tasks, section_index,
+    solo_drivers, combined_units, invisible_solo_names, staff_editors_by_id, logger,
 ):
-    """Fetch drivers from every ELD platform, match them to Asana tasks,
-    and update anything that changed. Returns nothing - everything
-    interesting is written to the log.
+    """Match already-fetched/grouped drivers against ONE Asana client's own
+    dispatch boards, writing every create/update/move/delete this cycle
+    needs. task_index/fallback_index/combined_tasks/section_index must
+    already be built by the caller (asana.build_task_index()/
+    build_section_index()) against THIS client's own project_ids.
 
-    Every keyword-only-in-spirit param after odometer_project_ids_by_
-    dispatch_id lets a caller (multi_sync.py's per-team loop) pass that
-    team's own state/credentials explicitly instead of relying on process
-    env vars or module-global dedup state - see TokenAlertState's
-    docstring. main() below omits all of them, so its single-team behavior
-    is completely unchanged.
+    Pulled out of run_one_cycle so a team with a SECOND, independent set of
+    dispatch boards covering the exact same company/driver list (e.g.
+    Texas's "Texas Day A/B" boards, covering the same companies as Texas
+    A/B/C just split two ways instead of three, for a smaller shift crew -
+    see run_one_cycle's asana_2 param and multi_sync.py) can run this a
+    second time reusing the ONE Factor/Leader ELD fetch, _group_co_drivers()
+    result, and fetch_staff_editors() result already computed by the
+    caller, instead of re-fetching any of it - that's what keeps a second
+    board group from doubling ELD API calls (and re-triggering rate-limit
+    storms).
 
-    A driver whose company has no section on any dispatch board is only
-    ever logged as a warning here - never alerted over Telegram. Adding a
-    brand-new company to a board is a deliberate, admin-initiated action
-    via the bot's "Company Assign" menu (see control_bot/router.py's
-    _show_menu_create_section_boards/_prompt_create_section), not
-    something this sync loop offers to do automatically."""
-
-    all_drivers = []
-
-    # Each platform is wrapped in its own try/except so that if one of them
-    # is down (network error, expired login, bad response, etc.) the other
-    # one still runs normally instead of the whole sync failing.
-    try:
-        all_drivers.extend(eld_factor.fetch_drivers(
-            logger, session_token=factor_session_token, tenant_id=factor_tenant_id,
-            company_filter=factor_company_filter,
-        ))
-        _mark_factor_fetch_ok(token_state)
-    except Exception as exc:
-        logger.exception("Factor ELD fetch failed this run - continuing without it.")
-        _handle_factor_fetch_failure(exc, control, token_state)
-
-    try:
-        all_drivers.extend(eld_leader.fetch_drivers(
-            logger, session_token=leader_session_token, tenant_id=leader_tenant_id,
-        ))
-    except Exception:
-        logger.exception("Leader ELD fetch failed this run - continuing without it.")
-
-    if not all_drivers:
-        logger.warning("No drivers were fetched from any platform this run.")
-        return
-
-    try:
-        task_index, fallback_index, combined_tasks = asana.build_task_index()
-        section_index = asana.build_section_index()
-    except Exception:
-        logger.exception("Could not read tasks from Asana - skipping this run.")
-        return
-
-    if odometer_project_ids_by_dispatch_id:
-        _sync_odometer_board(
-            asana, odometer_project_ids_by_dispatch_id, logger, section_index,
-            factor_session_token=factor_session_token, factor_tenant_id=factor_tenant_id,
-            leader_session_token=leader_session_token, leader_tenant_id=leader_tenant_id,
-        )
-
+    Every counter/set below is intentionally fresh per call - one board
+    group's write pass must never see another board group's
+    names_with_a_task/combined_gids_in_use, since those reflect "does this
+    name have a task in THIS specific set of boards", not any other one."""
     changed_count = 0
     unchanged_count = 0
     not_found_count = 0
@@ -588,65 +548,6 @@ def run_one_cycle(
     # cleanup pass below, which would otherwise see both names in
     # names_with_a_task and delete it.
     combined_gids_in_use = set()
-
-    solo_drivers, combined_units = _group_co_drivers(all_drivers, logger)
-
-    # Names of every solo driver who's currently invisible (Off Platform, or
-    # no vehicle assigned) - used below to catch a stale combined task where
-    # BOTH former co-drivers have gone invisible at once. The normal cleanup
-    # only deletes a stale combined task once one member's own replacement
-    # task is confirmed to exist - but if neither member gets a new task
-    # (because both are now invisible), that signal never comes, and the
-    # old combined task is orphaned forever. Confirmed happening for real:
-    # a co-driver pair at A M R TRANSPORT CORP stayed combined in Asana
-    # after both were deactivated in Factor ELD.
-    invisible_solo_names = {
-        normalize_name(d.name) for d in solo_drivers if compute_invisibility_reason(d) is not None
-    }
-
-    # Only ask who last edited a logbook for drivers who'll actually show up
-    # in Asana - this endpoint is one HTTP call per driver with no bulk
-    # equivalent, so doing this for the whole fleet would be far slower than
-    # it needs to be (see eld_factor.fetch_staff_editors). Split by platform
-    # (Driver.source) since each platform's commits have to be fetched with
-    # that platform's own credentials.
-    factor_driver_ids = [
-        d.driver_id for d in solo_drivers
-        if d.driver_id and compute_invisibility_reason(d) is None and d.source == "Factor ELD"
-    ]
-    leader_driver_ids = [
-        d.driver_id for d in solo_drivers
-        if d.driver_id and compute_invisibility_reason(d) is None and d.source == "Leader ELD"
-    ]
-    for unit in combined_units:
-        ids = [did for did in unit["member_driver_ids"] if did]
-        if unit["source"] == "Leader ELD":
-            leader_driver_ids.extend(ids)
-        else:
-            factor_driver_ids.extend(ids)
-
-    staff_editors_by_id = {}
-    try:
-        staff_editors_by_id.update(eld_factor.fetch_staff_editors(
-            factor_driver_ids, logger, session_token=factor_session_token,
-            tenant_id=factor_tenant_id, staff_roster=staff_roster, algo_label=algo_label,
-        ))
-    except Exception:
-        logger.exception(
-            "Factor ELD: failed to fetch logbook edit history - continuing "
-            "without Staff ID updates this run."
-        )
-
-    try:
-        staff_editors_by_id.update(eld_leader.fetch_staff_editors(
-            leader_driver_ids, logger, session_token=leader_session_token,
-            tenant_id=leader_tenant_id, staff_roster=staff_roster, algo_label=algo_label,
-        ))
-    except Exception:
-        logger.exception(
-            "Leader ELD: failed to fetch logbook edit history - continuing "
-            "without Staff ID updates this run."
-        )
 
     for driver in solo_drivers:
         driver_key = normalize_name(driver.name)
@@ -1002,6 +903,161 @@ def run_one_cycle(
         "%s driver(s) with no matching task/section.",
         changed_count, unchanged_count, created_count, deleted_count, not_found_count,
     )
+
+
+def run_one_cycle(
+    asana, control=None, odometer_project_ids_by_dispatch_id=None,
+    token_state=None,
+    factor_session_token=None, factor_tenant_id=None, factor_company_filter=None,
+    leader_session_token=None, leader_tenant_id=None,
+    staff_roster=None, algo_label=None,
+    asana_2=None,
+):
+    """Fetch drivers from every ELD platform, match them to Asana tasks,
+    and update anything that changed. Returns nothing - everything
+    interesting is written to the log.
+
+    Every keyword-only-in-spirit param after odometer_project_ids_by_
+    dispatch_id lets a caller (multi_sync.py's per-team loop) pass that
+    team's own state/credentials explicitly instead of relying on process
+    env vars or module-global dedup state - see TokenAlertState's
+    docstring. main() below omits all of them, so its single-team behavior
+    is completely unchanged.
+
+    asana_2, if given, is a SECOND AsanaClient covering an independent set
+    of dispatch boards that should reflect the exact same driver data as
+    the primary `asana` client (e.g. Texas's "Texas Day A/B" boards,
+    covering the same companies as Texas A/B/C just split two ways instead
+    of three) - see _sync_dispatch_board_group. The one Factor/Leader ELD
+    fetch and staff-editor lookup below are shared between both board
+    groups; only the match-against-Asana-and-write step runs twice. Every
+    existing single-board-group caller omits this, so its behavior is
+    unchanged.
+
+    A driver whose company has no section on any dispatch board is only
+    ever logged as a warning here - never alerted over Telegram. Adding a
+    brand-new company to a board is a deliberate, admin-initiated action
+    via the bot's "Company Assign" menu (see control_bot/router.py's
+    _show_menu_create_section_boards/_prompt_create_section), not
+    something this sync loop offers to do automatically."""
+
+    all_drivers = []
+
+    # Each platform is wrapped in its own try/except so that if one of them
+    # is down (network error, expired login, bad response, etc.) the other
+    # one still runs normally instead of the whole sync failing.
+    try:
+        all_drivers.extend(eld_factor.fetch_drivers(
+            logger, session_token=factor_session_token, tenant_id=factor_tenant_id,
+            company_filter=factor_company_filter,
+        ))
+        _mark_factor_fetch_ok(token_state)
+    except Exception as exc:
+        logger.exception("Factor ELD fetch failed this run - continuing without it.")
+        _handle_factor_fetch_failure(exc, control, token_state)
+
+    try:
+        all_drivers.extend(eld_leader.fetch_drivers(
+            logger, session_token=leader_session_token, tenant_id=leader_tenant_id,
+        ))
+    except Exception:
+        logger.exception("Leader ELD fetch failed this run - continuing without it.")
+
+    if not all_drivers:
+        logger.warning("No drivers were fetched from any platform this run.")
+        return
+
+    try:
+        task_index, fallback_index, combined_tasks = asana.build_task_index()
+        section_index = asana.build_section_index()
+    except Exception:
+        logger.exception("Could not read tasks from Asana - skipping this run.")
+        return
+
+    if odometer_project_ids_by_dispatch_id:
+        _sync_odometer_board(
+            asana, odometer_project_ids_by_dispatch_id, logger, section_index,
+            factor_session_token=factor_session_token, factor_tenant_id=factor_tenant_id,
+            leader_session_token=leader_session_token, leader_tenant_id=leader_tenant_id,
+        )
+
+    solo_drivers, combined_units = _group_co_drivers(all_drivers, logger)
+
+    # Names of every solo driver who's currently invisible (Off Platform, or
+    # no vehicle assigned) - used below to catch a stale combined task where
+    # BOTH former co-drivers have gone invisible at once. The normal cleanup
+    # only deletes a stale combined task once one member's own replacement
+    # task is confirmed to exist - but if neither member gets a new task
+    # (because both are now invisible), that signal never comes, and the
+    # old combined task is orphaned forever. Confirmed happening for real:
+    # a co-driver pair at A M R TRANSPORT CORP stayed combined in Asana
+    # after both were deactivated in Factor ELD.
+    invisible_solo_names = {
+        normalize_name(d.name) for d in solo_drivers if compute_invisibility_reason(d) is not None
+    }
+
+    # Only ask who last edited a logbook for drivers who'll actually show up
+    # in Asana - this endpoint is one HTTP call per driver with no bulk
+    # equivalent, so doing this for the whole fleet would be far slower than
+    # it needs to be (see eld_factor.fetch_staff_editors). Split by platform
+    # (Driver.source) since each platform's commits have to be fetched with
+    # that platform's own credentials.
+    factor_driver_ids = [
+        d.driver_id for d in solo_drivers
+        if d.driver_id and compute_invisibility_reason(d) is None and d.source == "Factor ELD"
+    ]
+    leader_driver_ids = [
+        d.driver_id for d in solo_drivers
+        if d.driver_id and compute_invisibility_reason(d) is None and d.source == "Leader ELD"
+    ]
+    for unit in combined_units:
+        ids = [did for did in unit["member_driver_ids"] if did]
+        if unit["source"] == "Leader ELD":
+            leader_driver_ids.extend(ids)
+        else:
+            factor_driver_ids.extend(ids)
+
+    staff_editors_by_id = {}
+    try:
+        staff_editors_by_id.update(eld_factor.fetch_staff_editors(
+            factor_driver_ids, logger, session_token=factor_session_token,
+            tenant_id=factor_tenant_id, staff_roster=staff_roster, algo_label=algo_label,
+        ))
+    except Exception:
+        logger.exception(
+            "Factor ELD: failed to fetch logbook edit history - continuing "
+            "without Staff ID updates this run."
+        )
+
+    try:
+        staff_editors_by_id.update(eld_leader.fetch_staff_editors(
+            leader_driver_ids, logger, session_token=leader_session_token,
+            tenant_id=leader_tenant_id, staff_roster=staff_roster, algo_label=algo_label,
+        ))
+    except Exception:
+        logger.exception(
+            "Leader ELD: failed to fetch logbook edit history - continuing "
+            "without Staff ID updates this run."
+        )
+
+    _sync_dispatch_board_group(
+        asana, task_index, fallback_index, combined_tasks, section_index,
+        solo_drivers, combined_units, invisible_solo_names, staff_editors_by_id, logger,
+    )
+
+    if asana_2 is not None:
+        try:
+            task_index_2, fallback_index_2, combined_tasks_2 = asana_2.build_task_index()
+            section_index_2 = asana_2.build_section_index()
+        except Exception:
+            logger.exception(
+                "Could not read tasks from Asana (second board group) - skipping it this run."
+            )
+        else:
+            _sync_dispatch_board_group(
+                asana_2, task_index_2, fallback_index_2, combined_tasks_2, section_index_2,
+                solo_drivers, combined_units, invisible_solo_names, staff_editors_by_id, logger,
+            )
 
 
 DATABASE_SYNC_INTERVAL_SECONDS = 1 * 60 * 60
