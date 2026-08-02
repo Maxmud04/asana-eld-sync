@@ -1063,10 +1063,24 @@ class AsanaClient:
         self._odometer_config_cache[project_id] = config
         return config
 
-    def _get_or_create_odometer_section(self, project_id, company_name):
+    def _get_or_create_odometer_section(self, project_id, company_name, divider_name=None):
         """Same idea as _get_or_create_database_section - look up (by
         normalized name) which section a company already has in this
-        project, creating a new one the first time it's seen."""
+        project, creating a new one the first time it's seen.
+
+        divider_name, if given, is the name of this company's own board's
+        visual header section (see ODOMETER_DIVIDER_SECTION_NAMES -
+        "Texas A"/"Texas B"/"Texas C" - used when every board shares one
+        Odometer Jump project). A brand-new section is positioned right
+        after that divider so it stays visually grouped under the right
+        board - Asana's default (no explicit position) is to append new
+        sections at the very end of the project, which is what caused
+        every company to pile up below all three dividers instead of
+        grouped under them (confirmed live, 2026-08-02). Silently does
+        nothing extra if divider_name isn't a real section here (e.g. a
+        genuinely separate Odometer Jump project per board, with no
+        dividers at all) - the section just lands wherever Asana puts it,
+        same as before this existed."""
         cache = self._odometer_section_cache.setdefault(project_id, {})
         if not cache:
             for section in self._fetch_sections(project_id):
@@ -1091,6 +1105,23 @@ class AsanaClient:
             "Odometer Jump board: created new section '%s' (first driver "
             "seen there).", display_name,
         )
+
+        if divider_name:
+            divider_gid = cache.get(normalize_company_name(divider_name))
+            if divider_gid is not None:
+                try:
+                    self._request(
+                        "POST",
+                        f"{ASANA_API_BASE}/projects/{project_id}/sections/insert",
+                        json={"data": {"section": section_gid, "after_section": divider_gid}},
+                    )
+                except Exception:
+                    self.logger.exception(
+                        "Odometer Jump board: created section '%s' but failed to "
+                        "position it under '%s' - it'll show up wherever Asana "
+                        "put it instead.", display_name, divider_name,
+                    )
+
         return section_gid
 
     def build_odometer_task_index(self, project_id):
@@ -1137,12 +1168,13 @@ class AsanaClient:
             }
         return index
 
-    def create_odometer_task(self, project_id, company_name, driver_name, issue_type, occurred_at=None):
+    def create_odometer_task(self, project_id, company_name, driver_name, issue_type, occurred_at=None, divider_name=None):
         """Create a brand-new Odometer Jump task for a driver who just
         started having an active odometer problem, under their company's
-        section (creating it if needed). Returns the new task's gid."""
+        section (creating it if needed - see _get_or_create_odometer_section
+        for divider_name). Returns the new task's gid."""
         config = self._get_odometer_project_config(project_id)
-        section_gid = self._get_or_create_odometer_section(project_id, company_name)
+        section_gid = self._get_or_create_odometer_section(project_id, company_name, divider_name)
 
         task = self._request(
             "POST",

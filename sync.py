@@ -439,7 +439,7 @@ def _sync_odometer_board(
             )
             continue
         issues_by_odometer_project.setdefault(odometer_project_id, []).append(
-            (name, company_name, issue_type, occurred_at),
+            (name, company_name, issue_type, occurred_at, board_info["project_name"]),
         )
 
     for odometer_project_id, issues in issues_by_odometer_project.items():
@@ -456,14 +456,17 @@ def _sync_one_odometer_project(asana, odometer_project_id, issues, logger):
         return
 
     keys_still_active = set()
-    for name, company_name, issue_type, occurred_at in issues:
+    for name, company_name, issue_type, occurred_at, divider_name in issues:
         key = (normalize_company_name(company_name), normalize_name(name))
         keys_still_active.add(key)
         existing = index.get(key)
 
         if existing is None:
             try:
-                new_task_gid = asana.create_odometer_task(odometer_project_id, company_name, name, issue_type, occurred_at)
+                new_task_gid = asana.create_odometer_task(
+                    odometer_project_id, company_name, name, issue_type, occurred_at,
+                    divider_name=divider_name,
+                )
                 logger.info("Odometer Jump board: created task for '%s' (%s, %s).", name, issue_type, occurred_at)
                 # Same fix as the Database board: a second driver_id sharing
                 # this same (company, name) later in this loop must see the
