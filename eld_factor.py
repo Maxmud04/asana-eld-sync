@@ -38,8 +38,14 @@ from eld_common import Driver, DriverDatabaseRecord, map_status
 # How many companies to fetch from Factor ELD at the same time. Each
 # company's data is independent, so fetching several in parallel cuts the
 # total wait a lot (117 companies one-at-a-time took about 2 minutes;
-# fetching 10 at a time takes more like 15-20 seconds).
-MAX_PARALLEL_COMPANY_FETCHES = 10
+# fetching 10 at a time takes more like 15-20 seconds). Lowered from 10 to
+# 3 (2026-08-05): confirmed the backend itself is healthy (an isolated
+# single request always succeeds instantly) while every live cycle kept
+# 403'ing even after spacing cycles much further apart - pointing at
+# burst concurrency at the start of each fetch as the actual trigger, not
+# how often a cycle runs. This costs some speed per fetch but should stop
+# tripping the limit in the first place.
+MAX_PARALLEL_COMPANY_FETCHES = 3
 
 # The "system-list" endpoint returns every company at once, but with 2000+
 # drivers spread across ~22 pages of live, constantly-changing data, drivers
@@ -88,7 +94,7 @@ FMCSA_PAGE_SIZE = 20
 PAGE_SIZE = 100  # how many drivers to ask for per page
 MAX_RETRIES = 3
 RETRY_DELAY_SECONDS = 2
-MAX_PARALLEL_COMMIT_FETCHES = 10
+MAX_PARALLEL_COMMIT_FETCHES = 3  # lowered from 10 (2026-08-05) - same burst-concurrency reasoning as MAX_PARALLEL_COMPANY_FETCHES above
 
 # Company names permanently excluded from every board (dispatch, Database,
 # Odometer Jump), on both Factor ELD and Leader ELD - confirmed these are
