@@ -19,6 +19,7 @@ a silent empty result.
 """
 
 import logging
+import time
 
 import asana_client
 import eld_factor
@@ -26,24 +27,63 @@ import eld_leader
 
 _logger = logging.getLogger("control_bot.validators")
 
+# How many times to retry a validation check that fails with a transient
+# error (403/429/5xx - see _is_retryable_validation_error) before actually
+# telling the user their token/tenant_id is bad. Confirmed live (2026-08-03):
+# a brand-new token/tenant_id pair has no cached company list to fall back
+# on (unlike eld_factor.py's own _discover_companies cache, which only
+# helps once a tenant has been seen before) - so a validation check run
+# during a transient rate-limit storm on the ELD backend would otherwise
+# reject a perfectly valid token as "invalid", right when a team most needs
+# rotation to work (their old token just died). A real bad/expired token
+# still fails immediately below - see _is_retryable_validation_error.
+_VALIDATION_RETRIES = 3
+_VALIDATION_RETRY_DELAY_SECONDS = 5
+
+
+def _is_retryable_validation_error(exc):
+    """True for a transient backend hiccup (403/429/5xx after
+    eld_factor.py's own 3 internal retries already failed) worth retrying
+    here too. False for a genuinely bad/expired token - eld_factor.py
+    raises that as a plain RuntimeError with its own distinct message (see
+    this module's docstring), never retried internally, and shouldn't be
+    retried here either - retrying a truly bad token just wastes time
+    before giving the same correct "invalid" answer."""
+    return not isinstance(exc, RuntimeError)
+
+
+def _check_with_retries(fetch_fn):
+    last_exc = None
+    for attempt in range(1, _VALIDATION_RETRIES + 1):
+        try:
+            return True, fetch_fn()
+        except Exception as exc:
+            last_exc = exc
+            if not _is_retryable_validation_error(exc) or attempt == _VALIDATION_RETRIES:
+                return False, str(exc)
+            _logger.warning(
+                "Validation check hit a transient error (attempt %s/%s) - "
+                "retrying in %ss before concluding the token is actually "
+                "bad: %s",
+                attempt, _VALIDATION_RETRIES, _VALIDATION_RETRY_DELAY_SECONDS, exc,
+            )
+            time.sleep(_VALIDATION_RETRY_DELAY_SECONDS)
+    return False, str(last_exc)  # unreachable, satisfies linters
+
 
 def check_factor(session_token, tenant_id):
     """Returns (True, message) or (False, message)."""
-    try:
-        drivers = eld_factor.fetch_drivers(
-            _logger, session_token=session_token, tenant_id=tenant_id, apply_company_filter=False,
-        )
-    except Exception as exc:
-        return False, str(exc)
-    return True, f"{len(drivers)} driver(s) visible"
+    ok, result = _check_with_retries(lambda: eld_factor.fetch_drivers(
+        _logger, session_token=session_token, tenant_id=tenant_id, apply_company_filter=False,
+    ))
+    return (True, f"{len(result)} driver(s) visible") if ok else (False, result)
 
 
 def check_leader(session_token, tenant_id):
-    try:
-        drivers = eld_leader.fetch_drivers(_logger, session_token=session_token, tenant_id=tenant_id)
-    except Exception as exc:
-        return False, str(exc)
-    return True, f"{len(drivers)} driver(s) visible"
+    ok, result = _check_with_retries(
+        lambda: eld_leader.fetch_drivers(_logger, session_token=session_token, tenant_id=tenant_id)
+    )
+    return (True, f"{len(result)} driver(s) visible") if ok else (False, result)
 
 
 def check_asana(token):
