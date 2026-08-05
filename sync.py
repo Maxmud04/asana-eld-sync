@@ -1063,7 +1063,7 @@ def run_one_cycle(
             )
 
 
-DATABASE_SYNC_INTERVAL_SECONDS = 1 * 60 * 60
+DATABASE_SYNC_INTERVAL_SECONDS = 40 * 60
 
 
 def run_database_cycle(

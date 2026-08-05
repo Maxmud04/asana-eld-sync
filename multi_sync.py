@@ -87,6 +87,10 @@ class TeamRuntimeState:
         # (config_store's asana_project_ids_2 column is NULL for them).
         self.asana_client_2 = None
         self.asana_project_ids_2 = None  # project_ids_2 asana_client_2 was built with
+        self.last_odometer_sync = 0.0
+
+
+ODOMETER_SYNC_INTERVAL_SECONDS = 30 * 60  # user-requested cadence (2026-08-05) - was every dispatch cycle before
 
 
 def _build_odometer_mapping(project_ids, odometer_ids_raw):
@@ -149,6 +153,18 @@ def run_team_cycle(config_store, bot_token, team_id, state, logger):
             "its %s dispatch board(s) - Odometer Jump sync disabled until fixed.",
             team_id, odometer_raw, len(project_ids),
         )
+
+    # Odometer Jump runs on its own, much slower cadence (user-requested,
+    # 2026-08-05) instead of every dispatch cycle - only pass the real
+    # mapping through to run_one_cycle once it's actually due; otherwise
+    # pass None so this cycle's _sync_odometer_board call is skipped
+    # entirely (same no-op path as a team with no Odometer board
+    # configured at all).
+    due_for_odometer = time.time() - state.last_odometer_sync >= ODOMETER_SYNC_INTERVAL_SECONDS
+    if odometer_mapping is not None and due_for_odometer:
+        state.last_odometer_sync = time.time()
+    elif odometer_mapping is not None:
+        odometer_mapping = None
 
     chat_ids = config_store.chat_ids_for_team(team_id)
     control = _TeamControl(bot_token, chat_ids, config_store, team_id, logger)
