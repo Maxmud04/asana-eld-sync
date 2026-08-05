@@ -817,6 +817,18 @@ def _dedupe_duplicate_person_records(tagged_raw_drivers, logger, platform_label=
 # concurrent cycle (see multi_sync.py's team-level concurrency) raced ahead.
 _company_cache = {}
 COMPANY_CACHE_TTL_SECONDS = 1800  # 30 minutes
+# How often to even ATTEMPT a fresh discovery once the cache is stale -
+# separate from the freshness TTL above. Confirmed live (2026-08-03): once
+# the HOS Audit Transfer check started running every 30-60s (on top of the
+# regular 5-minute dispatch cycle), this endpoint started getting 403'd
+# heavily - every caller whose cache was stale/missing tried again
+# immediately, which is a big part of why. This cooldown means a failing
+# discovery only gets retried this often, not on every single caller's
+# every single call - the FMCSA check keeps its own fast cadence (that's
+# a deliberate choice, not something this cooldown touches), it just
+# reuses the same (possibly a few minutes stale) company list instead of
+# re-triggering a fresh, likely-to-fail fetch each time.
+COMPANY_DISCOVERY_RETRY_COOLDOWN_SECONDS = 120
 
 
 def _discover_companies(session, logger, tenant_id, platform_label="Factor ELD"):
@@ -827,17 +839,44 @@ def _discover_companies(session, logger, tenant_id, platform_label="Factor ELD")
     pages, we simply notice it one refresh cycle later. That's a much
     smaller problem than using this same endpoint for actual duty-status
     accuracy (which is why driver data itself is always fetched per-company
-    instead, below)."""
+    instead, below).
+
+    Falls back to the last known company list (even if past its normal
+    freshness window) rather than raising, whenever a fresh attempt fails
+    and we have SOMETHING cached already - a temporary rate-limit hit on
+    this one endpoint shouldn't cascade into "no companies at all" for
+    every downstream caller. Only raises if there's truly no cached value
+    yet (e.g. right after a restart)."""
     now = time.time()
     cache_key = (tenant_id, session.headers.get("Authorization", ""))
     cache_entry = _company_cache.get(cache_key)
     if cache_entry is not None and (now - cache_entry["fetched_at"]) < COMPANY_CACHE_TTL_SECONDS:
         return cache_entry["companies"]
 
-    raw_drivers = _fetch_paged(
-        session, SYSTEM_LIST_API_BASE,
-        {"sort_by": "default", "sort_order": "default"}, logger, platform_label,
-    )
+    if (
+        cache_entry is not None
+        and (now - cache_entry.get("last_attempt_at", 0)) < COMPANY_DISCOVERY_RETRY_COOLDOWN_SECONDS
+    ):
+        return cache_entry["companies"]
+
+    try:
+        raw_drivers = _fetch_paged(
+            session, SYSTEM_LIST_API_BASE,
+            {"sort_by": "default", "sort_order": "default"}, logger, platform_label,
+        )
+    except Exception:
+        if cache_entry is not None:
+            logger.warning(
+                "%s: company discovery failed this attempt - reusing the last "
+                "known list of %s companies (last successfully refreshed "
+                "%.0f minute(s) ago) instead of failing this whole fetch.",
+                platform_label, len(cache_entry["companies"]),
+                (now - cache_entry["fetched_at"]) / 60,
+            )
+            cache_entry["last_attempt_at"] = now
+            return cache_entry["companies"]
+        raise  # no fallback available at all yet - propagate as before
+
     seen = {}
     for raw in raw_drivers:
         company_id = raw.get("company_id")
@@ -845,7 +884,7 @@ def _discover_companies(session, logger, tenant_id, platform_label="Factor ELD")
             seen[company_id] = raw.get("company_name")
     companies = [{"company_id": cid, "company_name": name} for cid, name in seen.items()]
 
-    _company_cache[cache_key] = {"companies": companies, "fetched_at": now}
+    _company_cache[cache_key] = {"companies": companies, "fetched_at": now, "last_attempt_at": now}
     logger.info("%s: discovered %s companies.", platform_label, len(companies))
     return companies
 
