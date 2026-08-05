@@ -26,6 +26,7 @@ here.
 
 import os
 import random
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -595,11 +596,35 @@ def _get_company_filter(explicit_filter=None):
     return [part.strip() for part in raw.split(",") if part.strip()]
 
 
+# Confirmed live (2026-08-05): even after spacing whole cycles further
+# apart AND cutting per-cycle concurrency (MAX_PARALLEL_COMPANY_FETCHES/
+# MAX_PARALLEL_COMMIT_FETCHES 10 -> 3), every live cycle still 403'd on
+# company discovery for hours straight, while an isolated single request
+# from a completely different network path always succeeded instantly -
+# pointing at a shared limit across every one of this PROCESS's own
+# concurrent callers (both teams' dispatch loops, both teams' HOS Audit
+# Transfer loops - possibly rate-limited by source IP rather than by
+# token, which a same-token isolated test from a different machine
+# would never reveal). This lock makes EVERY outbound Factor/Leader ELD
+# request across the whole process happen one at a time, with a minimum
+# gap between them, no matter which team/loop/platform it's for -
+# eliminating any possibility of this process itself causing overlapping
+# requests, regardless of which of the above theories is the real one.
+_HTTP_REQUEST_LOCK = threading.Lock()
+_last_request_at = [0.0]
+MIN_REQUEST_GAP_SECONDS = 0.5
+
+
 def _request_with_retries(session, url, params, logger, platform_label="Factor ELD"):
     last_error = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            resp = session.get(url, params=params, timeout=30)
+            with _HTTP_REQUEST_LOCK:
+                wait = MIN_REQUEST_GAP_SECONDS - (time.time() - _last_request_at[0])
+                if wait > 0:
+                    time.sleep(wait)
+                resp = session.get(url, params=params, timeout=30)
+                _last_request_at[0] = time.time()
             if resp.status_code == 401:
                 raise RuntimeError(
                     f"{platform_label} rejected the request as unauthorized - "
