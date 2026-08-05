@@ -90,7 +90,7 @@ class TeamRuntimeState:
         self.last_odometer_sync = 0.0
 
 
-ODOMETER_SYNC_INTERVAL_SECONDS = 30 * 60  # user-requested cadence (2026-08-05) - was every dispatch cycle before
+ODOMETER_SYNC_INTERVAL_SECONDS = 20 * 60  # user-requested cadence (2026-08-05) - was every dispatch cycle before
 
 
 def _build_odometer_mapping(project_ids, odometer_ids_raw):
