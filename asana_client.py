@@ -618,6 +618,28 @@ class AsanaClient:
         )
         return section["data"]["gid"]
 
+    def list_section_task_gids(self, section_gid):
+        """Every task gid currently in one section, in ANY project - used
+        by the "Move Company" bot flow (see control_bot/router.py's
+        _handle_move_company_callback) to move every one of a company's
+        existing tasks to a different board's section. Same endpoint
+        cleanup_empty_odometer_sections already uses for its own
+        emptiness check (with limit=1) - this is the unlimited version."""
+        tasks = self._request(
+            "GET", f"{ASANA_API_BASE}/sections/{section_gid}/tasks?opt_fields=gid",
+        )
+        return [t["gid"] for t in tasks["data"]]
+
+    def delete_section(self, section_gid):
+        """Delete a section outright, in ANY project - used once a
+        section is confirmed empty (e.g. every task in it was just moved
+        elsewhere - see the "Move Company" bot flow). Generalizes the
+        inline DELETE call cleanup_empty_odometer_sections already makes
+        for the Odometer Jump board specifically, so dispatch-board and
+        Odometer-board cleanup share one method instead of duplicating
+        the same request."""
+        self._request("DELETE", f"{ASANA_API_BASE}/sections/{section_gid}")
+
     def _stage_enum_option(
         self, custom_fields, field_gid, options, value, project_name, field_label, task_label, auto_create=False,
     ):
@@ -1263,7 +1285,7 @@ class AsanaClient:
             )
             if tasks["data"]:
                 continue
-            self._request("DELETE", f"{ASANA_API_BASE}/sections/{section['gid']}")
+            self.delete_section(section["gid"])
             self._odometer_section_cache.get(project_id, {}).pop(
                 normalize_company_name(section.get("name") or ""), None
             )

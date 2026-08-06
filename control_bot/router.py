@@ -40,6 +40,7 @@ _ROTATABLE_FIELDS = {
 # its own page with a "« Back to Bot" button that always returns here.
 MAIN_MENU_BUTTONS = [
     ("Company Assign", "menu:companyassign"),
+    ("Move Company", "menu:movecompany"),
     ("Rotate Tokens", "menu:rotate"),
     ("Truck Numbers", "menu:trucks"),
     ("Staff Roster", "menu:staffroster"),
@@ -110,6 +111,10 @@ class TeamRouter:
                 # Always legitimate - only ever created for an already-
                 # registered team (see _prompt_create_section).
                 self._handle_create_section_reply(chat_id, data, raw_text)
+            elif state == "AWAITING_MOVE_COMPANY_NAME":
+                # Always legitimate - only ever created for an already-
+                # registered team (see _prompt_move_company_name).
+                self._handle_move_company_name_reply(chat_id, data, raw_text)
             elif state == "AWAITING_STAFF_ADD":
                 # Always legitimate - only ever created for an already-
                 # registered team (see _prompt_staff_roster_add).
@@ -215,6 +220,8 @@ class TeamRouter:
                 self._handle_assign_callback(chat_id, message_id, sender_id, data)
             elif data.startswith("skip:"):
                 self._handle_skip_callback(chat_id, message_id, data)
+            elif data.startswith("moveco:"):
+                self._handle_move_company_callback(chat_id, message_id, data)
             else:
                 self.logger.warning("Unrecognized callback_data: %r", data)
         finally:
@@ -349,6 +356,8 @@ class TeamRouter:
             self._show_menu_create_section_boards(chat_id, message_id, team_id)
         elif action.startswith("createsection:"):
             self._prompt_create_section(chat_id, message_id, team_id, action.split(":", 1)[1])
+        elif action == "movecompany":
+            self._show_menu_movecompany_source_boards(chat_id, message_id, team_id)
         elif action == "rotate":
             buttons = [(label, f"menu:rotate:{cmd}") for cmd, (_, label, _tenant_field) in _ROTATABLE_FIELDS.items()]
             buttons.append(BACK_BUTTON)
@@ -485,6 +494,226 @@ class TeamRouter:
         if skipped:
             lines.append(f"Already existed, skipped: {', '.join(skipped)}")
         self.gateway.send_buttons(chat_id, "\n".join(lines) or "Nothing to do.", [BACK_BUTTON])
+
+    def _team_all_dispatch_project_ids(self, team):
+        """Every dispatch board a team has, across BOTH board groups when
+        a second one exists (see config_store's asana_project_ids_2,
+        multi_sync.py's second-board-group support) - used by "Move
+        Company" so a company can move between ANY two of a team's
+        boards, not just within the primary group."""
+        ids = [p.strip() for p in team["asana_project_ids"].split(",") if p.strip()]
+        ids += [p.strip() for p in (team.get("asana_project_ids_2") or "").split(",") if p.strip()]
+        return ids
+
+    def _show_menu_movecompany_source_boards(self, chat_id, message_id, team_id):
+        """The menu's "Move Company" entry - step 1 of 3 (pick the board
+        the company is CURRENTLY on, type its exact name, pick the
+        destination board - see _handle_move_company_name_reply/
+        _handle_move_company_callback)."""
+        team = self.config_store.get_team(team_id)
+        client = asana_client.AsanaClient(team["asana_token"], [], self.logger)
+        project_ids = self._team_all_dispatch_project_ids(team)
+        buttons = [
+            (name, f"moveco:src:{team_id}:{project_id}")
+            for project_id, name in client.get_project_names(project_ids).items()
+        ]
+        buttons.append(BACK_BUTTON)
+        self.gateway.edit_message_text(
+            chat_id, message_id, "Which board is the company currently on?", buttons=buttons,
+        )
+
+    def _handle_move_company_callback(self, chat_id, message_id, data):
+        """Routes both button-tap steps of the "Move Company" flow.
+        callback_data shape: "moveco:src:<team_id>:<project_id>" (step 1)
+        or "moveco:target:<team_id>:<project_id>" (step 3, after the
+        company name was typed - see _handle_move_company_name_reply).
+        team_id is embedded (not resolved from "currently active team")
+        the same way companyassign:/assign: already do, since the button
+        was generated for a specific team that might not still be this
+        chat's active one by the time it's tapped."""
+        _, sub_action, team_id, project_id = data.split(":", 3)
+        if team_id not in self.config_store.team_ids_for_chat(chat_id):
+            self.gateway.send_message(chat_id, "This button isn't for your team - ignoring.")
+            return
+        if sub_action == "src":
+            self._prompt_move_company_name(chat_id, message_id, team_id, project_id)
+        elif sub_action == "target":
+            self._execute_move_company(chat_id, message_id, team_id, project_id)
+        else:
+            self.logger.warning("Unrecognized moveco sub-action: %r", data)
+
+    def _prompt_move_company_name(self, chat_id, message_id, team_id, source_project_id):
+        team = self.config_store.get_team(team_id)
+        client = asana_client.AsanaClient(team["asana_token"], [], self.logger)
+        source_project_name = client.get_project_names([source_project_id]).get(source_project_id, source_project_id)
+        self.config_store.save_onboarding_session(
+            chat_id, "AWAITING_MOVE_COMPANY_NAME",
+            {"team_id": team_id, "source_project_id": source_project_id, "source_project_name": source_project_name},
+        )
+        self.gateway.edit_message_text(
+            chat_id, message_id,
+            f"Send the exact company name to move off of {source_project_name} (or /cancel to stop).",
+            buttons=[BACK_BUTTON],
+        )
+
+    def _handle_move_company_name_reply(self, chat_id, data, raw_text):
+        text = raw_text.strip()
+        if text.lower() == "/cancel":
+            self.config_store.clear_onboarding_session(chat_id)
+            self.gateway.send_buttons(chat_id, "Cancelled.", [BACK_BUTTON])
+            return
+
+        team_id = data["team_id"]
+        source_project_id = data["source_project_id"]
+        source_project_name = data["source_project_name"]
+        team = self.config_store.get_team(team_id)
+        client = asana_client.AsanaClient(team["asana_token"], [], self.logger)
+
+        typed_key = asana_client.normalize_company_name(text)
+        match = next(
+            (
+                s for s in client._fetch_sections(source_project_id)
+                if asana_client.normalize_company_name(s.get("name") or "") == typed_key
+            ),
+            None,
+        )
+        if match is None:
+            self.gateway.send_message(
+                chat_id,
+                f"Couldn't find '{text}' on {source_project_name} - check the spelling "
+                "and send it again, or /cancel to stop.",
+            )
+            return  # stays in AWAITING_MOVE_COMPANY_NAME so they can retype
+
+        self.config_store.save_onboarding_session(
+            chat_id, "AWAITING_MOVE_COMPANY_NAME",
+            {
+                "team_id": team_id, "source_project_id": source_project_id,
+                "source_project_name": source_project_name,
+                "company_name": match["name"], "source_section_gid": match["gid"],
+            },
+        )
+
+        other_project_ids = [pid for pid in self._team_all_dispatch_project_ids(team) if pid != source_project_id]
+        buttons = [
+            (name, f"moveco:target:{team_id}:{project_id}")
+            for project_id, name in client.get_project_names(other_project_ids).items()
+        ]
+        buttons.append(BACK_BUTTON)
+        self.gateway.send_buttons(chat_id, f"Move '{match['name']}' to which board?", buttons)
+
+    def _execute_move_company(self, chat_id, message_id, team_id, dest_project_id):
+        """Step 3's answer - does the actual move. Every driver task
+        currently in the source board's section for this company gets
+        moved to a matching (or newly-created) section on the
+        destination board via the already-existing move_task_to_section
+        (asana_client.py - already handles the cross-project add/remove),
+        then the now-empty source section is deleted.
+
+        Each task's field values (Status/Vehicle Number/Violation/Staff
+        ID/Staff ID History) are captured before the move and restored
+        immediately after, rather than left for the next sync cycle to
+        eventually rewrite - confirmed live (moving Austin Logistics/
+        Mobal Trucking between Texas Day A/B) that a cross-project move
+        only changes section/project membership, never custom field
+        VALUES, since the destination project's fields are separate
+        objects even when they share the same names."""
+        session = self.config_store.get_onboarding_session(chat_id)
+        if session is None or session[0] != "AWAITING_MOVE_COMPANY_NAME" or "company_name" not in session[1]:
+            self.gateway.edit_message_text(
+                chat_id, message_id,
+                "That move isn't in progress anymore - start over from the menu.",
+                buttons=[BACK_BUTTON],
+            )
+            return
+
+        _, data = session
+        source_project_id = data["source_project_id"]
+        source_project_name = data["source_project_name"]
+        company_name = data["company_name"]
+        source_section_gid = data["source_section_gid"]
+
+        if dest_project_id == source_project_id:
+            self.gateway.edit_message_text(
+                chat_id, message_id, "That's already the current board - nothing to do.", buttons=[BACK_BUTTON],
+            )
+            self.config_store.clear_onboarding_session(chat_id)
+            return
+
+        team = self.config_store.get_team(team_id)
+        source_client = asana_client.AsanaClient(team["asana_token"], [source_project_id], self.logger)
+        dest_client = asana_client.AsanaClient(team["asana_token"], [dest_project_id], self.logger)
+        dest_project_name = dest_client.get_project_names([dest_project_id]).get(dest_project_id, dest_project_id)
+
+        pre_task_index, _, _ = source_client.build_task_index()
+        captured_by_gid = {}
+        for matches in pre_task_index.values():
+            for m in matches:
+                if m.get("current_section_gid") == source_section_gid and m["task_gid"] not in captured_by_gid:
+                    captured_by_gid[m["task_gid"]] = {
+                        "status": m.get("current_status"),
+                        # current_vehicle_number is already formatted for
+                        # THIS project's field type (e.g. "#123" for a
+                        # text field) - strip that back off so
+                        # update_task_status's own vehicle_field_value
+                        # call formats it correctly for the DESTINATION
+                        # project's field instead of double-prefixing it.
+                        "vehicle_number": (
+                            str(m["current_vehicle_number"]).lstrip("#")
+                            if m.get("current_vehicle_number") is not None else None
+                        ),
+                        "violation": m.get("current_violation"),
+                        "staff_id": m.get("current_staff_id"),
+                        "staff_history": m.get("current_staff_history"),
+                    }
+
+        dest_key = asana_client.normalize_company_name(company_name)
+        dest_match = next(
+            (
+                s for s in dest_client._fetch_sections(dest_project_id)
+                if asana_client.normalize_company_name(s.get("name") or "") == dest_key
+            ),
+            None,
+        )
+        dest_section_gid = dest_match["gid"] if dest_match else dest_client.create_section(dest_project_id, company_name)
+        dest_section_info = {"project_id": dest_project_id, "section_gid": dest_section_gid}
+
+        task_gids = source_client.list_section_task_gids(source_section_gid)
+        for task_gid in task_gids:
+            try:
+                source_client.move_task_to_section(task_gid, source_project_id, dest_section_info)
+            except Exception:
+                self.logger.exception("Move Company: failed to move task %s for '%s'.", task_gid, company_name)
+
+        if captured_by_gid:
+            post_task_index, _, _ = dest_client.build_task_index()
+            post_matches_by_gid = {
+                m["task_gid"]: m
+                for matches in post_task_index.values()
+                for m in matches
+                if m.get("current_section_gid") == dest_section_gid
+            }
+            for task_gid, values in captured_by_gid.items():
+                new_match = post_matches_by_gid.get(task_gid)
+                if new_match is None:
+                    continue
+                try:
+                    dest_client.update_task_status(
+                        new_match, values["status"], values["vehicle_number"], values["violation"],
+                        values["staff_id"], values["staff_history"],
+                    )
+                except Exception:
+                    self.logger.exception("Move Company: failed to restore field values for task %s.", task_gid)
+
+        source_client.delete_section(source_section_gid)
+
+        self.config_store.clear_onboarding_session(chat_id)
+        self.gateway.edit_message_text(
+            chat_id, message_id,
+            f"Moved {len(task_gids)} driver(s) for '{company_name}' from "
+            f"{source_project_name} to {dest_project_name}.",
+            buttons=[BACK_BUTTON],
+        )
 
     def _handle_staff_add_reply(self, chat_id, data, raw_text):
         text = raw_text.strip()
