@@ -443,12 +443,22 @@ def _sync_odometer_board(
         )
 
     for odometer_project_id, issues in issues_by_odometer_project.items():
-        _sync_one_odometer_project(asana, odometer_project_id, issues, logger)
+        _sync_one_odometer_project(asana, odometer_project_id, issues, logger, section_index)
 
 
-def _sync_one_odometer_project(asana, odometer_project_id, issues, logger):
+def _sync_one_odometer_project(asana, odometer_project_id, issues, logger, section_index):
     """Reconcile one dispatch board's own Odometer Jump project against its
-    slice of currently-active issues - see _sync_odometer_board."""
+    slice of currently-active issues - see _sync_odometer_board.
+
+    section_index protects any company we don't actually manage (never
+    assigned to one of our own dispatch boards - e.g. a company on a
+    different ELD platform entirely, manually added straight into Asana)
+    from the cleanup sweep below. Without this, ANY task whose company
+    isn't in this cycle's active-issues list gets deleted - which is
+    correct for a real Factor/Leader ELD company whose issue actually
+    resolved, but would also silently wipe out a manually-entered
+    other-platform company every single cycle, since it can never appear
+    in keys_still_active (this sync never fetches that platform at all)."""
     try:
         index = asana.build_odometer_task_index(odometer_project_id)
     except Exception:
@@ -490,6 +500,13 @@ def _sync_one_odometer_project(asana, odometer_project_id, issues, logger):
 
     for key, match in index.items():
         if key in keys_still_active:
+            continue
+        if key[0] not in section_index:
+            # This task's company isn't one we actually manage (never
+            # assigned to any of our own dispatch boards) - could be a
+            # manually-added entry for a different ELD platform entirely.
+            # We have no way to confirm via Factor/Leader ELD whether its
+            # issue is really resolved, so never touch it.
             continue
         try:
             asana.delete_task(match["task_gid"])
