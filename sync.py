@@ -569,6 +569,27 @@ def _sync_dispatch_board_group(
     # names_with_a_task and delete it.
     combined_gids_in_use = set()
 
+    # Confirmed live (2026-08-12): matching a driver to a task is done
+    # PURELY by normalized name, with no regard for which company section
+    # the match is actually sitting in - a manually-managed company (e.g.
+    # a driver roster from a different ELD platform entirely, entered
+    # straight into Asana) is invisible to this sync, but a task under it
+    # can still coincidentally share a name with a REAL Factor/Leader
+    # driver elsewhere. When that real driver goes invisible (or changes
+    # company), the delete/move logic below used to act on EVERY matching
+    # task regardless of company, silently deleting or relocating the
+    # manually-entered one too - this is exactly what happened to POP ELD
+    # Beyond Trucking LLC (7 of 15 manually-added drivers deleted this
+    # way). known_company_names is every company this cycle's real
+    # Factor/Leader data actually reports - a match sitting under any
+    # OTHER company is never touched below, no matter what its name is.
+    known_company_names = {
+        normalize_company_name(d.company_name) for d in solo_drivers if d.company_name
+    }
+    known_company_names.update(
+        normalize_company_name(u["company_name"]) for u in combined_units if u.get("company_name")
+    )
+
     for driver in solo_drivers:
         driver_key = normalize_name(driver.name)
         matches = _lookup_matches(driver.name, task_index, fallback_index)
@@ -624,6 +645,12 @@ def _sync_dispatch_board_group(
             # you've confirmed for the Off Platform case, and the same
             # logic applies here.
             for match in matches:
+                if normalize_company_name(match.get("current_section_name") or "") not in known_company_names:
+                    # This match's company isn't one Factor/Leader ELD
+                    # actually reports this cycle - a same-named
+                    # coincidence with a manually-managed company's own
+                    # task, not really this driver's task. Never touch it.
+                    continue
                 try:
                     asana.delete_task(match["task_gid"])
                     deleted_count += 1
@@ -639,6 +666,12 @@ def _sync_dispatch_board_group(
 
         names_with_a_task.add(driver_key)
         for match in matches:
+            if normalize_company_name(match.get("current_section_name") or "") not in known_company_names:
+                # Same-named coincidence with a manually-managed company's
+                # own task (see known_company_names above) - never move it
+                # or overwrite its fields just because a same-named real
+                # driver happens to exist somewhere else.
+                continue
             correct_section_info = section_index.get(normalize_company_name(driver.company_name))
             if (
                 correct_section_info is not None
@@ -866,6 +899,11 @@ def _sync_dispatch_board_group(
         # since they share the task we just created.
         for name in unit["member_names"]:
             for individual_match in _lookup_matches(name, task_index, fallback_index):
+                if (
+                    normalize_company_name(individual_match.get("current_section_name") or "")
+                    not in known_company_names
+                ):
+                    continue  # same-named coincidence with a manually-managed task - never touch it
                 try:
                     asana.delete_task(individual_match["task_gid"])
                     deleted_count += 1
