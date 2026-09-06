@@ -590,6 +590,39 @@ def _sync_dispatch_board_group(
         normalize_company_name(u["company_name"]) for u in combined_units if u.get("company_name")
     )
 
+    # Confirmed live (2026-09-06): known_company_names alone doesn't cover
+    # a name collision between TWO REAL companies - e.g. "Mohamed El
+    # Alem" exists both as an inactive driver at STS SMART
+    # TRANSPORTATION SOLUTIONS INC and a currently-active one at KAMOUR
+    # TRUCKING INC (a real, tracked company). Processing the inactive STS
+    # record finds and deletes BOTH matching tasks by name, wiping out
+    # the other company's genuinely active driver too - known_company_
+    # names doesn't stop this since KAMOUR is a perfectly real company.
+    # visible_driver_keys is every (company, name) pair belonging to a
+    # driver who's ACTUALLY active/visible somewhere this cycle - a
+    # match whose own (company, name) shows up here belongs to that
+    # other, still-active driver, not the one currently being processed,
+    # and must never be deleted/moved/overwritten on their behalf.
+    visible_driver_keys = {
+        (normalize_company_name(d.company_name), normalize_name(d.name))
+        for d in solo_drivers if compute_invisibility_reason(d) is None and d.company_name
+    }
+    visible_driver_keys.update(
+        (normalize_company_name(u["company_name"]), normalize_name(n))
+        for u in combined_units if u.get("company_name")
+        for n in u["member_names"]
+    )
+
+    def _match_belongs_to_someone_else(match, driver_company_key):
+        """True if this match's own (company, name) belongs to a
+        DIFFERENT, currently-active driver than the one we're processing
+        - see visible_driver_keys above."""
+        match_key = (
+            normalize_company_name(match.get("current_section_name") or ""),
+            normalize_name(match.get("task_title") or ""),
+        )
+        return match_key in visible_driver_keys and match_key != driver_company_key
+
     for driver in solo_drivers:
         driver_key = normalize_name(driver.name)
         matches = _lookup_matches(driver.name, task_index, fallback_index)
@@ -651,6 +684,11 @@ def _sync_dispatch_board_group(
                     # coincidence with a manually-managed company's own
                     # task, not really this driver's task. Never touch it.
                     continue
+                if _match_belongs_to_someone_else(match, (normalize_company_name(driver.company_name), driver_key)):
+                    # This match's own (company, name) belongs to a
+                    # DIFFERENT, currently-active driver elsewhere who
+                    # happens to share this name - see visible_driver_keys.
+                    continue
                 try:
                     asana.delete_task(match["task_gid"])
                     deleted_count += 1
@@ -665,12 +703,18 @@ def _sync_dispatch_board_group(
             continue
 
         names_with_a_task.add(driver_key)
+        driver_company_key = (normalize_company_name(driver.company_name), driver_key)
         for match in matches:
             if normalize_company_name(match.get("current_section_name") or "") not in known_company_names:
                 # Same-named coincidence with a manually-managed company's
                 # own task (see known_company_names above) - never move it
                 # or overwrite its fields just because a same-named real
                 # driver happens to exist somewhere else.
+                continue
+            if _match_belongs_to_someone_else(match, driver_company_key):
+                # This match is actually a DIFFERENT, currently-active
+                # driver's own task (same name, different real company) -
+                # see visible_driver_keys. Never move or overwrite it.
                 continue
             correct_section_info = section_index.get(normalize_company_name(driver.company_name))
             if (
@@ -898,12 +942,15 @@ def _sync_dispatch_board_group(
         # over from before they were paired together - that's now redundant
         # since they share the task we just created.
         for name in unit["member_names"]:
+            member_company_key = (normalize_company_name(unit["company_name"]), normalize_name(name))
             for individual_match in _lookup_matches(name, task_index, fallback_index):
                 if (
                     normalize_company_name(individual_match.get("current_section_name") or "")
                     not in known_company_names
                 ):
                     continue  # same-named coincidence with a manually-managed task - never touch it
+                if _match_belongs_to_someone_else(individual_match, member_company_key):
+                    continue  # actually a different, currently-active driver's own task - never touch it
                 try:
                     asana.delete_task(individual_match["task_gid"])
                     deleted_count += 1
