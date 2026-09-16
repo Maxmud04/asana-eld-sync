@@ -102,6 +102,36 @@ class Provisioner:
 
         self.rewrite_env(team_id)
 
+    def add_dispatch_board(self, team_id, board_name, group="primary"):
+        """Bootstrap one brand-new dispatch board and append it to a
+        team's existing board group - self-service growth (see control_
+        bot/router.py's "Add Board" menu) for a team like Missouri that
+        started with 2 boards and needs a 3rd, without a one-off script.
+
+        group="primary" appends to asana_project_ids (every team has
+        this one); group="secondary" appends to asana_project_ids_2,
+        creating it if the team didn't have a second board group yet
+        (see multi_sync.py's run_one_cycle asana_2 param - Texas's
+        "Texas Day A/B" boards are the only current example). Pushes the
+        existing staff roster onto the new board the same way initial
+        provisioning does, so its Staff ID/Staff ID History dropdowns
+        aren't empty on day one. Returns the new project_id."""
+        team = self.config_store.get_team(team_id)
+        client = asana_client.AsanaClient(team["asana_token"], [], self.logger)
+        project_id = client.bootstrap_dispatch_project(
+            team["workspace_gid"], board_name, team.get("asana_team_gid"),
+        )
+        self._populate_staff_roster(client, project_id, team.get("staff_roster") or {})
+
+        column = "asana_project_ids" if group == "primary" else "asana_project_ids_2"
+        existing_ids = [p.strip() for p in (team.get(column) or "").split(",") if p.strip()]
+        existing_ids.append(project_id)
+        self.config_store.update_team(team_id, **{column: ",".join(existing_ids)})
+
+        if group == "primary":
+            self.rewrite_env(team_id)  # .env only ever tracks the primary group, see rewrite_env
+        return project_id
+
     def _populate_staff_roster(self, client, dispatch_project_id, staff_roster):
         """Add each roster entry as a Staff ID option (and its matching
         Staff ID History option). These two fields are never generic across
@@ -110,13 +140,38 @@ class Provisioner:
         creates them empty and this fills them in from what onboarding
         collected. Reuses _get_project_config directly (rather than adding
         a public wrapper) since this is the same cache-building lookup
-        every other method on AsanaClient already relies on internally."""
+        every other method on AsanaClient already relies on internally.
+
+        Each entry is added independently - confirmed live (2026-09-16)
+        that a team's roster can genuinely have two people sharing the
+        same short Staff ID code (e.g. name-spelling variants of the
+        same person, added at different times via "Staff Roster" -> "Add
+        Person") - Asana rejects the second, identical "#<code>" Staff ID
+        option outright. Letting that single duplicate raise would abort
+        every entry after it, and (via add_dispatch_board) skip the
+        config_store update entirely, orphaning an otherwise-real new
+        board. One bad/duplicate entry is logged and skipped instead."""
         if not staff_roster:
             return
         config = client._get_project_config(dispatch_project_id)
         for first_name, code in staff_roster.items():
-            client.add_enum_option(config["staff_id_field_gid"], f"#{code}")
-            client.add_enum_option(config["staff_history_field_gid"], f"{first_name.title()} {code}")
+            try:
+                client.add_enum_option(config["staff_id_field_gid"], f"#{code}")
+            except Exception:
+                self.logger.exception(
+                    "Could not add Staff ID option '#%s' to project %s (likely "
+                    "a duplicate code already used by another roster entry) - "
+                    "skipping it, continuing with the rest of the roster.",
+                    code, dispatch_project_id,
+                )
+            try:
+                client.add_enum_option(config["staff_history_field_gid"], f"{first_name.title()} {code}")
+            except Exception:
+                self.logger.exception(
+                    "Could not add Staff ID History option '%s %s' to project %s - "
+                    "skipping it, continuing with the rest of the roster.",
+                    first_name.title(), code, dispatch_project_id,
+                )
 
     def add_staff_roster_entry(self, team_id, first_name, code):
         """Add one new person to a team's Staff ID roster after the fact -

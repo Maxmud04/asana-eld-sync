@@ -41,6 +41,7 @@ _ROTATABLE_FIELDS = {
 MAIN_MENU_BUTTONS = [
     ("Company Assign", "menu:companyassign"),
     ("Move Company", "menu:movecompany"),
+    ("Add Board", "menu:addboard"),
     ("Rotate Tokens", "menu:rotate"),
     ("Truck Numbers", "menu:trucks"),
     ("Staff Roster", "menu:staffroster"),
@@ -115,6 +116,10 @@ class TeamRouter:
                 # Always legitimate - only ever created for an already-
                 # registered team (see _prompt_move_company_name).
                 self._handle_move_company_name_reply(chat_id, data, raw_text)
+            elif state == "AWAITING_ADD_BOARD_NAME":
+                # Always legitimate - only ever created for an already-
+                # registered team (see _prompt_add_board_name).
+                self._handle_add_board_name_reply(chat_id, data, raw_text)
             elif state == "AWAITING_STAFF_ADD":
                 # Always legitimate - only ever created for an already-
                 # registered team (see _prompt_staff_roster_add).
@@ -358,6 +363,10 @@ class TeamRouter:
             self._prompt_create_section(chat_id, message_id, team_id, action.split(":", 1)[1])
         elif action == "movecompany":
             self._show_menu_movecompany_source_boards(chat_id, message_id, team_id)
+        elif action == "addboard":
+            self._show_menu_addboard(chat_id, message_id, team_id)
+        elif action.startswith("addboard:"):
+            self._prompt_add_board_name(chat_id, message_id, team_id, action.split(":", 1)[1])
         elif action == "rotate":
             buttons = [(label, f"menu:rotate:{cmd}") for cmd, (_, label, _tenant_field) in _ROTATABLE_FIELDS.items()]
             buttons.append(BACK_BUTTON)
@@ -713,6 +722,65 @@ class TeamRouter:
             f"Moved {len(task_gids)} driver(s) for '{company_name}' from "
             f"{source_project_name} to {dest_project_name}.",
             buttons=[BACK_BUTTON],
+        )
+
+    def _show_menu_addboard(self, chat_id, message_id, team_id):
+        """The menu's "Add Board" entry - self-service growth for a team
+        that needs another dispatch board (e.g. Missouri going from 2
+        boards to 3), without a one-off script - see
+        provisioning.add_dispatch_board. A team with only one board group
+        skips straight to naming the new board; a team with two (see
+        config_store's asana_project_ids_2 - currently only Texas) is
+        asked which group to extend first."""
+        team = self.config_store.get_team(team_id)
+        if not (team.get("asana_project_ids_2") or "").strip():
+            self._prompt_add_board_name(chat_id, message_id, team_id, "primary")
+            return
+
+        client = asana_client.AsanaClient(team["asana_token"], [], self.logger)
+        primary_ids = [p.strip() for p in team["asana_project_ids"].split(",") if p.strip()]
+        secondary_ids = [p.strip() for p in team["asana_project_ids_2"].split(",") if p.strip()]
+        primary_names = ", ".join(client.get_project_names(primary_ids).values())
+        secondary_names = ", ".join(client.get_project_names(secondary_ids).values())
+        buttons = [
+            (f"Group 1 ({primary_names})", "menu:addboard:primary"),
+            (f"Group 2 ({secondary_names})", "menu:addboard:secondary"),
+            BACK_BUTTON,
+        ]
+        self.gateway.edit_message_text(
+            chat_id, message_id, "Which set of boards should the new one join?", buttons=buttons,
+        )
+
+    def _prompt_add_board_name(self, chat_id, message_id, team_id, group):
+        self.config_store.save_onboarding_session(
+            chat_id, "AWAITING_ADD_BOARD_NAME", {"team_id": team_id, "group": group},
+        )
+        self.gateway.edit_message_text(
+            chat_id, message_id,
+            "Send the name for the new board (e.g. 'Missouri C'), or /cancel to stop.",
+            buttons=[BACK_BUTTON],
+        )
+
+    def _handle_add_board_name_reply(self, chat_id, data, raw_text):
+        text = raw_text.strip()
+        if text.lower() == "/cancel":
+            self.config_store.clear_onboarding_session(chat_id)
+            self.gateway.send_buttons(chat_id, "Cancelled.", [BACK_BUTTON])
+            return
+        if not text:
+            self.gateway.send_message(chat_id, "Please send a name for the new board, or /cancel to stop.")
+            return
+
+        team_id = data["team_id"]
+        group = data["group"]
+        self.provisioning.add_dispatch_board(team_id, text, group)
+        self.config_store.clear_onboarding_session(chat_id)
+        self.gateway.send_buttons(
+            chat_id,
+            f"Created '{text}' and added it to the team's boards. "
+            "It'll start getting drivers on the next sync cycle - use "
+            "'Company Assign' or 'Move Company' to put companies on it.",
+            [BACK_BUTTON],
         )
 
     def _handle_staff_add_reply(self, chat_id, data, raw_text):
