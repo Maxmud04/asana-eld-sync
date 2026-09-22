@@ -1407,13 +1407,16 @@ class AsanaClient:
         from scratch for a new team: Status (Driving/Sleeping/Off Duty/On
         Duty - clean full words, not the abbreviated DR/SB/OFF/ON form one
         existing team later customized to on their own boards), Vehicle
-        Number (text), Violation (Shift/Break/Cycle/PTI Violation -
-        confirmed generic across every existing team's boards), and empty
-        Staff ID / Staff ID History enums (populated later, per-team, from
-        that team's own roster collected during onboarding - unlike
-        Violation, these are NOT generic). Deliberately does not create any
-        company section - same as every existing dispatch board, a team
-        adds its own sections as its own companies come in. Returns the new
+        Number (text), and an empty Staff ID enum (populated later,
+        per-team, from that team's own roster collected during onboarding -
+        this one is NOT generic across teams, unlike Status/Vehicle Number).
+        Deliberately does NOT create Violation or Staff ID History - both
+        were removed from every existing team's boards (2026-09-22, user
+        request) and every downstream field lookup already treats them as
+        optional, so a new team should start matching that same current
+        shape, not the old one. Deliberately does not create any company
+        section either - same as every existing dispatch board, a team adds
+        its own sections as its own companies come in. Returns the new
         project_id."""
         project_id = self.create_project(workspace_gid, name, team_gid)
 
@@ -1425,17 +1428,8 @@ class AsanaClient:
         vehicle_field_gid = self.create_text_custom_field(workspace_gid, "Vehicle Number")
         self.attach_custom_field(project_id, vehicle_field_gid)
 
-        violation_field_gid, _ = self.create_enum_custom_field(
-            workspace_gid, "Violation",
-            ["Shift Violation", "Break Violation", "Cycle Violation", "PTI Violation"],
-        )
-        self.attach_custom_field(project_id, violation_field_gid)
-
         staff_id_field_gid, _ = self.create_enum_custom_field(workspace_gid, "Staff ID")
         self.attach_custom_field(project_id, staff_id_field_gid)
-
-        staff_history_field_gid, _ = self.create_enum_custom_field(workspace_gid, "Staff ID History")
-        self.attach_custom_field(project_id, staff_history_field_gid)
 
         self.logger.info("Bootstrapped new dispatch board '%s' (project %s).", name, project_id)
         return project_id

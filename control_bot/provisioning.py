@@ -133,14 +133,21 @@ class Provisioner:
         return project_id
 
     def _populate_staff_roster(self, client, dispatch_project_id, staff_roster):
-        """Add each roster entry as a Staff ID option (and its matching
-        Staff ID History option). These two fields are never generic across
-        teams (confirmed live on the existing boards - they're one team's
-        own staff codes), unlike Violation, so bootstrap_dispatch_project()
-        creates them empty and this fills them in from what onboarding
-        collected. Reuses _get_project_config directly (rather than adding
-        a public wrapper) since this is the same cache-building lookup
-        every other method on AsanaClient already relies on internally.
+        """Add each roster entry as a Staff ID option. This field is never
+        generic across teams (confirmed live on the existing boards -
+        they're one team's own staff codes), unlike Status/Vehicle Number,
+        so bootstrap_dispatch_project() creates it empty and this fills it
+        in from what onboarding collected. Reuses _get_project_config
+        directly (rather than adding a public wrapper) since this is the
+        same cache-building lookup every other method on AsanaClient
+        already relies on internally.
+
+        Only ever touches Staff ID, never Staff ID History - that field was
+        removed from every team's boards (2026-09-22) and
+        bootstrap_dispatch_project no longer creates it, so
+        staff_history_field_gid is always None here; add_enum_option(None,
+        ...) would just 404. If it's ever reintroduced, this can start
+        populating it again the same way.
 
         Each entry is added independently - confirmed live (2026-09-16)
         that a team's roster can genuinely have two people sharing the
@@ -164,26 +171,18 @@ class Provisioner:
                     "skipping it, continuing with the rest of the roster.",
                     code, dispatch_project_id,
                 )
-            try:
-                client.add_enum_option(config["staff_history_field_gid"], f"{first_name.title()} {code}")
-            except Exception:
-                self.logger.exception(
-                    "Could not add Staff ID History option '%s %s' to project %s - "
-                    "skipping it, continuing with the rest of the roster.",
-                    first_name.title(), code, dispatch_project_id,
-                )
 
     def add_staff_roster_entry(self, team_id, first_name, code):
         """Add one new person to a team's Staff ID roster after the fact -
         see control_bot/router.py's "Staff Roster" menu. Unlike
         _populate_staff_roster (called once, at provisioning, against an
         empty field), this must add the Asana enum option to every one of
-        the team's dispatch boards' own Staff ID/Staff ID History fields
-        (each board has its own separate fields - see provision_team), and
-        must only ever add genuinely new/changed entries: add_enum_option
-        has no dedup of its own, so re-adding an unchanged existing name
-        would create a duplicate dropdown option every time this runs.
-        Returns the updated roster dict."""
+        the team's dispatch boards' own Staff ID field (each board has its
+        own separate field - see provision_team), and must only ever add
+        genuinely new/changed entries: add_enum_option has no dedup of its
+        own, so re-adding an unchanged existing name would create a
+        duplicate dropdown option every time this runs. Returns the
+        updated roster dict."""
         team = self.config_store.get_team(team_id)
         roster = dict(team.get("staff_roster") or {})
         key = first_name.strip().lower()
@@ -197,7 +196,6 @@ class Provisioner:
         for project_id in _all_dispatch_project_ids(team):
             config = client._get_project_config(project_id)
             client.add_enum_option(config["staff_id_field_gid"], f"#{code}")
-            client.add_enum_option(config["staff_history_field_gid"], f"{first_name.title()} {code}")
         return roster
 
     def set_commit_label(self, team_id, label):
@@ -210,7 +208,15 @@ class Provisioner:
         field blank, silently defeating the whole point of setting one.
         Passing an empty label clears it - _resolve_staff_editor already
         treats a falsy label as "leave blank", so no Asana option needs
-        adding for that case."""
+        adding for that case.
+
+        Staff ID History itself was removed from every team's boards
+        (2026-09-22) and bootstrap_dispatch_project no longer creates it -
+        staff_history_field_gid is always None now, so there's no dropdown
+        left to add the label to. Still saves the label (harmless, and
+        cheap to restore if the field ever comes back) but skips the
+        per-project Asana call instead of crashing on add_enum_option(None,
+        ...)."""
         self.config_store.update_team(team_id, algo_service_account_label=label)
         if not label:
             return
@@ -219,6 +225,8 @@ class Provisioner:
         client = asana_client.AsanaClient(team["asana_token"], [], self.logger)
         for project_id in _all_dispatch_project_ids(team):
             config = client._get_project_config(project_id)
+            if not config.get("staff_history_field_gid"):
+                continue
             existing = config["staff_history_options"]
             if label not in existing and label.strip().lower() not in existing:
                 client.add_enum_option(config["staff_history_field_gid"], label)
