@@ -38,7 +38,6 @@ def _all_dispatch_project_ids(team):
 # get a 2nd/3rd added later without any new plumbing, see the plan.
 _DISPATCH_BOARD_SUFFIX = "Dispatch"
 _DATABASE_BOARD_SUFFIX = "Database"
-_ODOMETER_BOARD_SUFFIX = "Odometer Jump"
 
 
 class Provisioner:
@@ -80,9 +79,12 @@ class Provisioner:
         database_project_id = data.get("existing_database_project_id") or client.bootstrap_database_project(
             workspace_gid, f"{team_name} {_DATABASE_BOARD_SUFFIX}", team_gid,
         )
-        odometer_project_id = client.bootstrap_odometer_project(
-            workspace_gid, f"{team_name} {_ODOMETER_BOARD_SUFFIX}", team_gid,
-        )
+        # Deliberately does NOT create an Odometer Jump board - it was
+        # removed from both Texas and Missouri's boards (2026-09-22, user
+        # request: "no need") and multi_sync.py's run_team_cycle already
+        # treats a team with no asana_odometer_project_id as simply having
+        # no Odometer board (see _build_odometer_mapping) - a new team
+        # should start matching that same current shape, not the old one.
 
         self.config_store.create_team(
             team_id, team_name,
@@ -92,7 +94,6 @@ class Provisioner:
             asana_token=data["asana_token"],
             asana_project_ids=",".join(dispatch_project_ids),
             asana_database_project_id=database_project_id,
-            asana_odometer_project_id=odometer_project_id,
             factor_session_token=data.get("factor_session_token"),
             factor_tenant_id=data.get("factor_tenant_id"),
             leader_session_token=data.get("leader_session_token"),
