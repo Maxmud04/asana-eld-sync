@@ -44,6 +44,23 @@ _ROSTER_LINE_PATTERN = re.compile(r"^\s*([A-Za-z][A-Za-z\-' ]*)\s*[:,\-]\s*([A-Z
 _ASANA_PROJECT_URL_PATTERN = re.compile(r"/project/(\d+)")
 
 
+def _clean_pasted_value(text):
+    """Strip copy-paste artifacts (a browser/phone keyboard's smart quotes,
+    a trailing comma from a JSON viewer) off a pasted credential. Mirrors
+    router.py's identically-named helper for the token-rotation flow -
+    onboarding used to skip this and only .strip() whitespace, so a token
+    wrapped in curly quotes (" ... ") got sent to Factor/Leader ELD with
+    the quote characters still attached, making a perfectly valid token
+    look "expired/unauthorized" (confirmed 2026-09-22 during a real
+    onboarding attempt)."""
+    return (
+        text.strip().rstrip(",").strip()
+        .strip('"').strip("'")
+        .strip("“").strip("”").strip("‘").strip("’")
+        .strip()
+    )
+
+
 def _parse_asana_project_ref(text):
     """Extract a project_id from a pasted Asana URL or bare numeric id, or
     None if text doesn't look like either."""
@@ -161,13 +178,13 @@ class OnboardingManager:
             self._advance(chat_id, STATE_ASK_LEADER_TOKEN, data)
             self.gateway.send_message(chat_id, "Paste your Leader ELD session token (or /skip).")
             return
-        data["factor_session_token"] = text
+        data["factor_session_token"] = _clean_pasted_value(text)
         self._advance(chat_id, STATE_ASK_FACTOR_TENANT, data)
         self.gateway.send_message(chat_id, "What's your Factor ELD tenant_id?")
 
     def _handle_factor_tenant(self, chat_id, sender_id, data, text):
-        data["factor_tenant_id"] = text
-        ok, message = self.validators.check_factor(data["factor_session_token"], text)
+        data["factor_tenant_id"] = _clean_pasted_value(text)
+        ok, message = self.validators.check_factor(data["factor_session_token"], data["factor_tenant_id"])
         if not ok:
             self._advance(chat_id, STATE_ASK_FACTOR_TOKEN, data)
             self.gateway.send_message(
@@ -184,13 +201,13 @@ class OnboardingManager:
             self._advance(chat_id, STATE_ASK_ASANA_TOKEN, data)
             self.gateway.send_message(chat_id, "Now paste your Asana personal access token.")
             return
-        data["leader_session_token"] = text
+        data["leader_session_token"] = _clean_pasted_value(text)
         self._advance(chat_id, STATE_ASK_LEADER_TENANT, data)
         self.gateway.send_message(chat_id, "What's your Leader ELD tenant_id?")
 
     def _handle_leader_tenant(self, chat_id, sender_id, data, text):
-        data["leader_tenant_id"] = text
-        ok, message = self.validators.check_leader(data["leader_session_token"], text)
+        data["leader_tenant_id"] = _clean_pasted_value(text)
+        ok, message = self.validators.check_leader(data["leader_session_token"], data["leader_tenant_id"])
         if not ok:
             self._advance(chat_id, STATE_ASK_LEADER_TOKEN, data)
             self.gateway.send_message(
@@ -202,6 +219,7 @@ class OnboardingManager:
         self.gateway.send_message(chat_id, "Now paste your Asana personal access token.")
 
     def _handle_asana_token(self, chat_id, sender_id, data, text):
+        text = _clean_pasted_value(text)
         data["asana_token"] = text
         ok, result = self.validators.check_asana(text)
         if not ok:
