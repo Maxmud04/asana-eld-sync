@@ -41,7 +41,19 @@ logger = logging.getLogger("multi_sync")
 # one team. Each team has its own AsanaClient/TeamRuntimeState/ELD session,
 # and ConfigStore's own write lock already serializes concurrent writes -
 # see config_store.py - so running these in parallel is safe.
-MAX_PARALLEL_TEAMS = 8
+#
+# Deliberately well below the actual team count (2026-09-22, scaling from
+# 2 teams to 8): every outbound Factor/Leader ELD request from this whole
+# service shares ONE static IP (see eld_factor.py's request lock/spacing -
+# added after a real ~21-hour outage traced to that IP getting rate-
+# limited). With 8 teams all active, a cap this high would let every
+# single one fire its cycle at the exact same moment each round, even
+# though each team now has its own separate ELD account - we've never
+# confirmed whether the backend limits by IP or by tenant, so this stays
+# conservative rather than risk finding out with 8 teams live. Lower
+# means more teams queue for a free slot instead of all bursting
+# together, spreading out when each team's own cycle actually starts.
+MAX_PARALLEL_TEAMS = 3
 
 
 class _TeamControl:
