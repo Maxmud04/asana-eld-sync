@@ -40,6 +40,13 @@ def fetch_drivers(logger, session_token=None, tenant_id=None):
     )
 
 
+def check_credentials(logger, session_token, tenant_id):
+    """Thin wrapper over eld_factor.check_credentials with Leader ELD's own
+    platform label - see its docstring for why onboarding validation uses
+    this one-request check instead of a full fetch_drivers() call."""
+    return eld_factor.check_credentials(logger, session_token, tenant_id, platform_label="Leader ELD")
+
+
 def _leader_credentials(logger, session_token=None, tenant_id=None):
     session_token = session_token or os.environ.get("LEADER_SESSION_TOKEN", "")
     tenant_id = tenant_id or os.environ.get("LEADER_TENANT_ID", "")

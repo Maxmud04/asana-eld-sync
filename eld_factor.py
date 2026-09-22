@@ -974,6 +974,52 @@ def _fetch_paged(session, url, extra_params, logger, platform_label="Factor ELD"
     return raw_drivers
 
 
+def check_credentials(logger, session_token, tenant_id, platform_label="Factor ELD"):
+    """Confirm a session_token/tenant_id pair is valid with exactly ONE
+    request (page 1 of the system-list endpoint), instead of a real
+    fetch_drivers() call's full company discovery (~22 pages for a large
+    tenant) plus one more request per company. control_bot's onboarding
+    validators (see validators.py's check_factor/check_leader) only need a
+    yes/no plus a rough driver count - they don't need the complete,
+    accurate list fetch_drivers() builds for real syncing.
+
+    This matters because _HTTP_REQUEST_LOCK above serializes EVERY
+    outbound Factor/Leader ELD request across the whole process, onboarding
+    validation included - a brand-new tenant_id has no cached company list
+    (unlike a live team's regular cycle, which reuses _discover_companies'
+    30-minute cache) to fall back on, so before this fix, checking one new
+    team's credentials meant queuing dozens of requests behind whatever
+    the live production sync teams were already doing (confirmed 2026-09-22:
+    reported as onboarding "stuck" for minutes at a time). One request
+    still waits its turn in that same queue, but only once.
+
+    Raises the same RuntimeError _request_with_retries already raises on a
+    genuine 401 (bad/expired token or wrong tenant_id) - callers don't need
+    to distinguish that from any other failure. Returns an approximate
+    driver count: exact if everything fits on page 1, otherwise a
+    page-1-count-plus-more estimate (good enough for "does this pair even
+    work", not meant for real dispatch data)."""
+    session = requests.Session()
+    session.headers.update({
+        "Authorization": f"Bearer {session_token}",
+        "Tenant_id": tenant_id,
+    })
+    body = _request_with_retries(
+        session, SYSTEM_LIST_API_BASE,
+        {
+            "page": 1, "limit": PAGE_SIZE, "sort_by": "default", "sort_order": "default",
+            "eld_status": "all", "duty_status": "all", "online_status": "all",
+            "violation_status": "all", "driver_status": "all",
+        },
+        logger, platform_label,
+    )
+    drivers = body["data"]["drivers"]
+    paging = body["data"].get("paging", {})
+    total_pages = paging.get("totalPages", 1)
+    count = len(drivers) if total_pages <= 1 else f"{len(drivers)}+"
+    return count
+
+
 def fetch_drivers(logger, session_token=None, tenant_id=None, platform_label="Factor ELD",
                     apply_company_filter=True, company_filter=None, company_name=None):
     """Return a list of eld_common.Driver records from Factor ELD (or Leader

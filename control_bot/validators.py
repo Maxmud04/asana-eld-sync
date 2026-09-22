@@ -72,18 +72,24 @@ def _check_with_retries(fetch_fn):
 
 
 def check_factor(session_token, tenant_id):
-    """Returns (True, message) or (False, message)."""
-    ok, result = _check_with_retries(lambda: eld_factor.fetch_drivers(
-        _logger, session_token=session_token, tenant_id=tenant_id, apply_company_filter=False,
+    """Returns (True, message) or (False, message). Uses check_credentials'
+    single-request check (2026-09-22) rather than a real fetch_drivers()
+    call - a full fetch means discovering every company (up to ~22 pages
+    for a large tenant) plus one more request per company, all serialized
+    behind live production traffic on the same process-wide rate-limit
+    lock (see eld_factor._HTTP_REQUEST_LOCK) - confirmed this made
+    onboarding a brand-new team feel "stuck" for minutes at a time."""
+    ok, result = _check_with_retries(lambda: eld_factor.check_credentials(
+        _logger, session_token, tenant_id,
     ))
-    return (True, f"{len(result)} driver(s) visible") if ok else (False, result)
+    return (True, f"{result} driver(s) visible") if ok else (False, result)
 
 
 def check_leader(session_token, tenant_id):
     ok, result = _check_with_retries(
-        lambda: eld_leader.fetch_drivers(_logger, session_token=session_token, tenant_id=tenant_id)
+        lambda: eld_leader.check_credentials(_logger, session_token, tenant_id)
     )
-    return (True, f"{len(result)} driver(s) visible") if ok else (False, result)
+    return (True, f"{result} driver(s) visible") if ok else (False, result)
 
 
 def check_asana(token):
