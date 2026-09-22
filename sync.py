@@ -27,6 +27,7 @@ import base64
 import json
 import logging
 import os
+import random
 import sys
 import time
 from datetime import datetime, timezone
@@ -77,6 +78,42 @@ def _lookup_matches(name, task_index, fallback_index):
     if not matches:
         matches = fallback_index.get(word_sort_key(name), [])
     return matches
+
+
+def _auto_assign_new_company(asana, company_name, section_index, logger):
+    """A company Factor/Leader ELD reports that has no section on ANY of
+    this board group's boards yet - create one on a board picked
+    uniformly at random from asana.project_ids (2026-09-22, user-
+    requested: Asana should always mirror Factor/Leader ELD's current
+    company list automatically, with zero manual step - it's meant to be
+    a ready-to-use fallback the moment a separate, unrelated dispatch
+    tool has a problem, so a brand-new company can't sit unassigned
+    waiting on an admin to run "Company Assign"). Updates section_index
+    in place so every other driver at this same company later in the
+    SAME cycle finds the section that was just created instead of each
+    creating their own duplicate. Returns the new section_info dict
+    (same shape section_index already holds), or None if creation
+    failed (logged, caller falls back to its own "no section" handling)."""
+    project_id = random.choice(asana.project_ids)
+    try:
+        section_gid = asana.create_section(project_id, company_name)
+    except Exception:
+        logger.exception(
+            "Failed to auto-create a section for new company '%s' on project %s.",
+            company_name, project_id,
+        )
+        return None
+    project_name = asana.get_project_names([project_id]).get(project_id, project_id)
+    section_info = {
+        "project_id": project_id, "project_name": project_name,
+        "section_gid": section_gid, "section_name": company_name,
+    }
+    section_index[normalize_company_name(company_name)] = section_info
+    logger.info(
+        "New company '%s' - auto-created a section on '%s' (no admin action needed).",
+        company_name, project_name,
+    )
+    return section_info
 
 
 def _group_co_drivers(all_drivers, logger):
@@ -642,7 +679,14 @@ def _sync_dispatch_board_group(
                     "new task.",
                     driver.name, invisibility_reason,
                 )
-            elif section_info is not None:
+            else:
+                if section_info is None:
+                    section_info = _auto_assign_new_company(
+                        asana, driver.company_name, section_index, logger,
+                    )
+                if section_info is None:
+                    not_found_count += 1
+                    continue
                 try:
                     staff_id, staff_history = _resolve_staff_for_driver(driver, staff_editors_by_id)
                     asana.create_task_for_driver(
@@ -660,14 +704,6 @@ def _sync_dispatch_board_group(
                     logger.exception(
                         "Failed to create a new Asana task for driver '%s'.", driver.name
                     )
-            else:
-                not_found_count += 1
-                logger.warning(
-                    "%s: no matching Asana task found, and no existing section for "
-                    "company '%s' to create one in (source: %s, status: %s) - use the "
-                    "bot's 'Company Assign' menu to add it to a board.",
-                    driver.name, driver.company_name, driver.source, driver.status,
-                )
             continue
 
         if invisibility_reason is not None:
@@ -907,13 +943,9 @@ def _sync_dispatch_board_group(
         # No existing combined task for this exact pair yet.
         section_info = section_index.get(normalize_company_name(unit["company_name"]))
         if section_info is None:
+            section_info = _auto_assign_new_company(asana, unit["company_name"], section_index, logger)
+        if section_info is None:
             not_found_count += 1
-            logger.warning(
-                "%s: co-driver pair has no matching combined task, and no "
-                "existing section for company '%s' to create one in "
-                "(source: %s, status: %s)",
-                unit["name"], unit["company_name"], unit["source"], unit["status"],
-            )
             continue
 
         staff_id, staff_history = _resolve_staff_for_combined_unit(unit, staff_editors_by_id, logger)
