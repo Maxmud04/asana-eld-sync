@@ -133,8 +133,20 @@ class EldRequestScheduler:
 # One shared instance for the whole process - every team, every loop
 # (dispatch, FMCSA, onboarding validation) submits through this same
 # scheduler, which is the entire point (see the module docstring).
-# max_concurrency=1 matches today's actual effective behavior (the old
-# lock never let more than one request through at a time either, despite
-# MAX_PARALLEL_COMPANY_FETCHES misleadingly suggesting 3) - this refactor
-# is step one specifically because it changes NOTHING about that.
-default_scheduler = EldRequestScheduler(max_concurrency=1, min_gap_seconds=0.5)
+#
+# max_concurrency=2 (raised from 1, 2026-09-22 - step two of the planned
+# rollout, after step one's queue/scheduler refactor was proven behavior-
+# neutral at concurrency=1). Verified live before raising this: a real,
+# watched, bounded sample (30 companies each) against BOTH Texas's Factor
+# ELD tenant and Missouri's Leader ELD tenant, at concurrency=2, gap left
+# unchanged at 0.5s to isolate concurrency as the one variable - zero
+# 429/403s on either, and a real 30-40% time reduction over concurrency=1
+# on the same sample size. Confirmed via the scheduler's own stats that
+# real request latency (~0.8-0.9s average) already exceeds the 0.5s gap,
+# so concurrency (letting two requests actually overlap in flight) is a
+# bigger lever here than further shrinking the gap alone would be.
+#
+# Next step (not yet done): test concurrency=3 the same way, on its own,
+# before raising further - see this file's docstring for why each step is
+# tested in isolation rather than jumping straight to a large value.
+default_scheduler = EldRequestScheduler(max_concurrency=2, min_gap_seconds=0.5)
