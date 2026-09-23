@@ -26,13 +26,14 @@ here.
 
 import os
 import random
-import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
+
+import eld_scheduler
 
 from eld_common import Driver, DriverDatabaseRecord, map_status
 
@@ -605,26 +606,28 @@ def _get_company_filter(explicit_filter=None):
 # concurrent callers (both teams' dispatch loops, both teams' HOS Audit
 # Transfer loops - possibly rate-limited by source IP rather than by
 # token, which a same-token isolated test from a different machine
-# would never reveal). This lock makes EVERY outbound Factor/Leader ELD
-# request across the whole process happen one at a time, with a minimum
-# gap between them, no matter which team/loop/platform it's for -
-# eliminating any possibility of this process itself causing overlapping
-# requests, regardless of which of the above theories is the real one.
-_HTTP_REQUEST_LOCK = threading.Lock()
-_last_request_at = [0.0]
-MIN_REQUEST_GAP_SECONDS = 0.5
+# would never reveal). Originally enforced here as a raw threading.Lock +
+# fixed sleep; moved into eld_scheduler.default_scheduler (2026-09-22, step
+# one of a larger redesign) for observability and a safe path to raising
+# throughput later - see that module's docstring. Behavior is unchanged:
+# every outbound Factor/Leader ELD request across the whole process still
+# happens one at a time, with the same minimum gap between them, no matter
+# which team/loop/platform it's for.
+MIN_REQUEST_GAP_SECONDS = eld_scheduler.default_scheduler.min_gap_seconds
+
+
+def _send_one_request(session, url, params):
+    """Exactly one HTTP GET, no retry logic - runs as a scheduled job (see
+    eld_scheduler.default_scheduler) so the scheduler, not this function,
+    decides when it's actually allowed to fire."""
+    return session.get(url, params=params, timeout=30)
 
 
 def _request_with_retries(session, url, params, logger, platform_label="Factor ELD"):
     last_error = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            with _HTTP_REQUEST_LOCK:
-                wait = MIN_REQUEST_GAP_SECONDS - (time.time() - _last_request_at[0])
-                if wait > 0:
-                    time.sleep(wait)
-                resp = session.get(url, params=params, timeout=30)
-                _last_request_at[0] = time.time()
+            resp = eld_scheduler.default_scheduler.submit(_send_one_request, session, url, params).result()
             if resp.status_code == 401:
                 raise RuntimeError(
                     f"{platform_label} rejected the request as unauthorized - "
@@ -1011,7 +1014,7 @@ def check_credentials(logger, session_token, tenant_id, platform_label="Factor E
     yes/no plus a rough driver count - they don't need the complete,
     accurate list fetch_drivers() builds for real syncing.
 
-    This matters because _HTTP_REQUEST_LOCK above serializes EVERY
+    This matters because eld_scheduler.default_scheduler serializes EVERY
     outbound Factor/Leader ELD request across the whole process, onboarding
     validation included - a brand-new tenant_id has no cached company list
     (unlike a live team's regular cycle, which reuses _discover_companies'

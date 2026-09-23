@@ -1162,7 +1162,7 @@ def run_one_cycle(
     # matter that it was already scoped to only visible drivers (see below) -
     # it's still hundreds of extra serialized requests every cycle for
     # nothing, on top of the whole process's shared Factor/Leader ELD rate
-    # limit (see eld_factor.py's _HTTP_REQUEST_LOCK). Cheap to check: these
+    # limit (see eld_scheduler.default_scheduler). Cheap to check: these
     # AsanaClient instances already had _get_project_config called (and
     # cached) for every one of their project_ids by build_task_index above.
     any_staff_history_field = any(

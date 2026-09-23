@@ -77,7 +77,7 @@ def check_factor(session_token, tenant_id):
     call - a full fetch means discovering every company (up to ~22 pages
     for a large tenant) plus one more request per company, all serialized
     behind live production traffic on the same process-wide rate-limit
-    lock (see eld_factor._HTTP_REQUEST_LOCK) - confirmed this made
+    lock (see eld_scheduler.default_scheduler) - confirmed this made
     onboarding a brand-new team feel "stuck" for minutes at a time."""
     ok, result = _check_with_retries(lambda: eld_factor.check_credentials(
         _logger, session_token, tenant_id,
