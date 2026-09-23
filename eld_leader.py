@@ -23,7 +23,7 @@ import os
 import eld_factor
 
 
-def fetch_drivers(logger, session_token=None, tenant_id=None):
+def fetch_drivers(logger, session_token=None, tenant_id=None, need_violations=True):
     """Return a list of eld_common.Driver records from Leader ELD, for the
     same per-company dispatch boards Factor ELD uses (Maxmud Test A/B/C).
 
@@ -31,12 +31,14 @@ def fetch_drivers(logger, session_token=None, tenant_id=None):
     (LEADER_SESSION_TOKEN/LEADER_TENANT_ID), but can be overridden - this is
     how a caller with its own per-team config (e.g. control_bot validating a
     team's pasted token before any .env exists for them) supplies Leader ELD
-    credentials directly instead of relying on os.environ."""
+    credentials directly instead of relying on os.environ. need_violations
+    passes straight through to eld_factor.fetch_drivers - see its docstring."""
     session_token, tenant_id = _leader_credentials(logger, session_token, tenant_id)
     if session_token is None:
         return []
     return eld_factor.fetch_drivers(
         logger, session_token, tenant_id, platform_label="Leader ELD", apply_company_filter=False,
+        need_violations=need_violations,
     )
 
 

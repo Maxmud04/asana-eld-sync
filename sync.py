@@ -1080,13 +1080,30 @@ def run_one_cycle(
 
     all_drivers = []
 
+    # Skip the whole violations fetch when no board in this group even has
+    # a Violation field to write it into - same reasoning as the Staff ID
+    # History skip further down (see any_staff_history_field's comment).
+    # Every current team's boards have had Violation removed (2026-09-22),
+    # so this is pure savings right now. Cheap to check even on a cold
+    # cache: _get_project_config makes one real request per project only
+    # the first time it's ever called on this AsanaClient instance - every
+    # cycle after that (including build_task_index's own calls below) hits
+    # the same persistent cache for free.
+    need_violations = any(
+        asana._get_project_config(pid).get("violation_field_gid")
+        for pid in asana.project_ids
+    ) or (asana_2 is not None and any(
+        asana_2._get_project_config(pid).get("violation_field_gid")
+        for pid in asana_2.project_ids
+    ))
+
     # Each platform is wrapped in its own try/except so that if one of them
     # is down (network error, expired login, bad response, etc.) the other
     # one still runs normally instead of the whole sync failing.
     try:
         all_drivers.extend(eld_factor.fetch_drivers(
             logger, session_token=factor_session_token, tenant_id=factor_tenant_id,
-            company_filter=factor_company_filter,
+            company_filter=factor_company_filter, need_violations=need_violations,
         ))
         _mark_factor_fetch_ok(token_state)
     except Exception as exc:
@@ -1096,6 +1113,7 @@ def run_one_cycle(
     try:
         all_drivers.extend(eld_leader.fetch_drivers(
             logger, session_token=leader_session_token, tenant_id=leader_tenant_id,
+            need_violations=need_violations,
         ))
     except Exception:
         logger.exception("Leader ELD fetch failed this run - continuing without it.")
@@ -1133,49 +1151,72 @@ def run_one_cycle(
         normalize_name(d.name) for d in solo_drivers if compute_invisibility_reason(d) is not None
     }
 
-    # Only ask who last edited a logbook for drivers who'll actually show up
-    # in Asana - this endpoint is one HTTP call per driver with no bulk
-    # equivalent, so doing this for the whole fleet would be far slower than
-    # it needs to be (see eld_factor.fetch_staff_editors). Split by platform
-    # (Driver.source) since each platform's commits have to be fetched with
-    # that platform's own credentials.
-    factor_driver_ids = [
-        d.driver_id for d in solo_drivers
-        if d.driver_id and compute_invisibility_reason(d) is None and d.source == "Factor ELD"
-    ]
-    leader_driver_ids = [
-        d.driver_id for d in solo_drivers
-        if d.driver_id and compute_invisibility_reason(d) is None and d.source == "Leader ELD"
-    ]
-    for unit in combined_units:
-        ids = [did for did in unit["member_driver_ids"] if did]
-        if unit["source"] == "Leader ELD":
-            leader_driver_ids.extend(ids)
-        else:
-            factor_driver_ids.extend(ids)
+    # Only bother asking who last edited a logbook if at least one board in
+    # this group actually still HAS a Staff ID History field to write the
+    # answer into. Every existing team's Staff ID History field was removed
+    # (2026-09-22, user request), so this now short-circuits to an empty
+    # dict for all of them - skipping what used to be one HTTP call per
+    # VISIBLE driver (with no bulk equivalent) for a result nobody could see
+    # anymore. Confirmed a real, measurable chunk of a 20-25 minute cycle at
+    # 3 teams/~1500 drivers: this endpoint has no bulk form, so it doesn't
+    # matter that it was already scoped to only visible drivers (see below) -
+    # it's still hundreds of extra serialized requests every cycle for
+    # nothing, on top of the whole process's shared Factor/Leader ELD rate
+    # limit (see eld_factor.py's _HTTP_REQUEST_LOCK). Cheap to check: these
+    # AsanaClient instances already had _get_project_config called (and
+    # cached) for every one of their project_ids by build_task_index above.
+    any_staff_history_field = any(
+        asana._get_project_config(pid).get("staff_history_field_gid")
+        for pid in asana.project_ids
+    ) or (asana_2 is not None and any(
+        asana_2._get_project_config(pid).get("staff_history_field_gid")
+        for pid in asana_2.project_ids
+    ))
 
     staff_editors_by_id = {}
-    try:
-        staff_editors_by_id.update(eld_factor.fetch_staff_editors(
-            factor_driver_ids, logger, session_token=factor_session_token,
-            tenant_id=factor_tenant_id, staff_roster=staff_roster, algo_label=algo_label,
-        ))
-    except Exception:
-        logger.exception(
-            "Factor ELD: failed to fetch logbook edit history - continuing "
-            "without Staff ID updates this run."
-        )
+    if any_staff_history_field:
+        # Only ask who last edited a logbook for drivers who'll actually
+        # show up in Asana - this endpoint is one HTTP call per driver with
+        # no bulk equivalent, so doing this for the whole fleet would be far
+        # slower than it needs to be (see eld_factor.fetch_staff_editors).
+        # Split by platform (Driver.source) since each platform's commits
+        # have to be fetched with that platform's own credentials.
+        factor_driver_ids = [
+            d.driver_id for d in solo_drivers
+            if d.driver_id and compute_invisibility_reason(d) is None and d.source == "Factor ELD"
+        ]
+        leader_driver_ids = [
+            d.driver_id for d in solo_drivers
+            if d.driver_id and compute_invisibility_reason(d) is None and d.source == "Leader ELD"
+        ]
+        for unit in combined_units:
+            ids = [did for did in unit["member_driver_ids"] if did]
+            if unit["source"] == "Leader ELD":
+                leader_driver_ids.extend(ids)
+            else:
+                factor_driver_ids.extend(ids)
 
-    try:
-        staff_editors_by_id.update(eld_leader.fetch_staff_editors(
-            leader_driver_ids, logger, session_token=leader_session_token,
-            tenant_id=leader_tenant_id, staff_roster=staff_roster, algo_label=algo_label,
-        ))
-    except Exception:
-        logger.exception(
-            "Leader ELD: failed to fetch logbook edit history - continuing "
-            "without Staff ID updates this run."
-        )
+        try:
+            staff_editors_by_id.update(eld_factor.fetch_staff_editors(
+                factor_driver_ids, logger, session_token=factor_session_token,
+                tenant_id=factor_tenant_id, staff_roster=staff_roster, algo_label=algo_label,
+            ))
+        except Exception:
+            logger.exception(
+                "Factor ELD: failed to fetch logbook edit history - continuing "
+                "without Staff ID updates this run."
+            )
+
+        try:
+            staff_editors_by_id.update(eld_leader.fetch_staff_editors(
+                leader_driver_ids, logger, session_token=leader_session_token,
+                tenant_id=leader_tenant_id, staff_roster=staff_roster, algo_label=algo_label,
+            ))
+        except Exception:
+            logger.exception(
+                "Leader ELD: failed to fetch logbook edit history - continuing "
+                "without Staff ID updates this run."
+            )
 
     _sync_dispatch_board_group(
         asana, task_index, fallback_index, combined_tasks, section_index,

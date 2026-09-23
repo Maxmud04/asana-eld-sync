@@ -633,6 +633,34 @@ def _request_with_retries(session, url, params, logger, platform_label="Factor E
                     f"depending on how it was issued) and needs to be manually "
                     f"refreshed in .env until automatic login is added."
                 )
+            if resp.status_code == 429:
+                # A real rate-limit response, not just a network hiccup or
+                # server error - handled separately (2026-09-22) so we can
+                # honor its own Retry-After header when present instead of
+                # always guessing with our own fixed backoff schedule.
+                # Never previously distinguished from a generic 5xx/network
+                # failure, which meant a real "you're going too fast" signal
+                # from the platform was being ignored in favor of our own
+                # blind exponential delay - exactly the kind of gap that
+                # makes a rate-limit incident worse instead of better.
+                last_error = requests.HTTPError(f"{platform_label} rate limit (429)")
+                retry_after = resp.headers.get("Retry-After")
+                logger.warning(
+                    "%s rate-limited us with a 429 (attempt %s/%s)%s.",
+                    platform_label, attempt, MAX_RETRIES,
+                    f" - its own Retry-After says wait {retry_after}s" if retry_after else "",
+                )
+                if attempt < MAX_RETRIES:
+                    if retry_after is not None:
+                        try:
+                            time.sleep(max(0.0, float(retry_after)))
+                        except ValueError:
+                            delay = RETRY_DELAY_SECONDS * (2 ** (attempt - 1))
+                            time.sleep(delay + random.uniform(0, delay))
+                    else:
+                        delay = RETRY_DELAY_SECONDS * (2 ** (attempt - 1))
+                        time.sleep(delay + random.uniform(0, delay))
+                continue
             if resp.status_code >= 500:
                 raise requests.HTTPError(f"{platform_label} server error {resp.status_code}")
             resp.raise_for_status()
@@ -1021,7 +1049,8 @@ def check_credentials(logger, session_token, tenant_id, platform_label="Factor E
 
 
 def fetch_drivers(logger, session_token=None, tenant_id=None, platform_label="Factor ELD",
-                    apply_company_filter=True, company_filter=None, company_name=None):
+                    apply_company_filter=True, company_filter=None, company_name=None,
+                    need_violations=True):
     """Return a list of eld_common.Driver records from Factor ELD (or Leader
     ELD - same backend, confirmed a different tenant on the exact same
     host/endpoints - see eld_leader.py, which calls this same function with
@@ -1033,7 +1062,17 @@ def fetch_drivers(logger, session_token=None, tenant_id=None, platform_label="Fa
     wrapper passes False. company_filter/company_name, if given, take
     priority over this process's own FACTOR_COMPANY_FILTER/FACTOR_COMPANY_NAME
     env vars - this is how a caller with its own per-team config supplies its
-    own filter without relying on this process's .env."""
+    own filter without relying on this process's .env.
+
+    need_violations=False skips the violations fetch entirely (see
+    _fetch_active_violations) - this file deliberately knows nothing about
+    Asana (see the module docstring), so it can't check for itself whether
+    any board even has a Violation field to write the result into; the
+    caller (sync.py, which does know) passes this through. Every current
+    team's boards have had their Violation field removed (2026-09-22), so
+    this fetch is pure waste for all of them right now - not per-company or
+    per-driver like the old Staff ID History fetch was, just one extra
+    paginated call, but free to skip when nothing will use it."""
     session_token = session_token or os.environ.get("FACTOR_SESSION_TOKEN", "")
     tenant_id = tenant_id or os.environ.get("FACTOR_TENANT_ID", "")
     if not session_token or not tenant_id:
@@ -1051,16 +1090,19 @@ def fetch_drivers(logger, session_token=None, tenant_id=None, platform_label="Fa
         "Tenant_id": tenant_id,
     })
 
-    try:
-        violations_by_key = _fetch_active_violations(session, logger, platform_label)
-    except Exception:
-        # A hiccup on the violations endpoint shouldn't stop the whole sync -
-        # everyone's Violation field just stays as it was until next cycle.
-        logger.exception(
-            "%s: failed to fetch violations - continuing without "
-            "violation data this run.", platform_label,
-        )
+    if not need_violations:
         violations_by_key = {}
+    else:
+        try:
+            violations_by_key = _fetch_active_violations(session, logger, platform_label)
+        except Exception:
+            # A hiccup on the violations endpoint shouldn't stop the whole sync -
+            # everyone's Violation field just stays as it was until next cycle.
+            logger.exception(
+                "%s: failed to fetch violations - continuing without "
+                "violation data this run.", platform_label,
+            )
+            violations_by_key = {}
 
     if company_filter is not None and len(company_filter) == 1:
         # Exactly one company to watch, and we already know its ID from
