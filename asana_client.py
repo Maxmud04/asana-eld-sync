@@ -25,8 +25,15 @@ ASANA_API_BASE = "https://app.asana.com/api/1.0"
 # We don't hardcode which custom field holds the duty status, because the
 # three real Asana projects each name it slightly differently. Instead we
 # look for a dropdown ("enum") field whose name matches one of these
-# (case-insensitive), and use whichever one is found first.
-STATUS_FIELD_NAME_CANDIDATES = ["status", "new driver", "duty status"]
+# (case-insensitive) - checked in THIS priority order (see _first_match),
+# not API/field order, so "eld status" always wins over the plain "status"
+# entry below. That matters for a team whose own pre-existing board already
+# has an unrelated "Status"/"STATUS" field (a messy dispatcher-notes column,
+# not a clean duty-status one) - we add our OWN separate "ELD Status" field
+# alongside it rather than writing into theirs (2026-09-22, confirmed with
+# a real team: their old boards' "STATUS" options were things like "sameload"
+# and "check P,F.", nothing like our Driving/Sleeping/On Duty/Off Duty).
+STATUS_FIELD_NAME_CANDIDATES = ["eld status", "status", "new driver", "duty status"]
 
 # Some projects abbreviate the Status dropdown's own OPTION labels instead
 # of using the full word (confirmed intentional for Maxmud Test A - its
@@ -53,8 +60,9 @@ def _clean_option_label(name):
 # The dropdown for truck/unit number to look for, if a project has one. Not
 # every project has this field (only Maxmud Test A does, right now) - when
 # a project doesn't, we simply skip writing a vehicle number there instead
-# of treating it as an error.
-VEHICLE_FIELD_NAME_CANDIDATES = ["vehicle number"]
+# of treating it as an error. "truck" added 2026-09-22 for a team whose
+# pre-existing board already used that name instead.
+VEHICLE_FIELD_NAME_CANDIDATES = ["vehicle number", "truck"]
 
 # The HOS violation dropdown to look for, if a project has one. Originally
 # spelled "Woring Vilation" (typo and all); renamed in different projects to
@@ -92,9 +100,9 @@ ODOMETER_DIVIDER_SECTION_NAMES = {"Texas A", "Texas B", "Texas C"}
 
 DATABASE_FIELD_NAME_CANDIDATES = {
     "co_driver": ["co-driver", "co driver"],
-    "vehicle_number": ["vehicle id"],
-    "email": ["email"],
-    "phone_number": ["ph number", "phone number"],
+    "vehicle_number": ["vehicle id", "unit number"],
+    "email": ["email", "email *"],
+    "phone_number": ["ph number", "phone number", "phone number *"],
     "cdl": ["cdl"],
     "state": ["state"],
     "login": ["login"],
@@ -242,70 +250,97 @@ class AsanaClient:
             "custom_field.enum_options.enabled",
         )
 
-        field_gid = None
-        field_name = None
-        options = {}
-        vehicle_field_gid = None
-        vehicle_field_type = None
-        violation_field_gid = None
-        violation_options = {}
-        staff_id_field_gid = None
-        staff_id_options = {}
-        staff_history_field_gid = None
-        staff_history_options = {}
+        # Group every custom field by (subtype, lower-cased name) first,
+        # rather than resolving each category inline as we walk the API's
+        # own field order - a project can have MORE THAN ONE enum field
+        # whose name matches some candidate list (e.g. a team's own
+        # pre-existing "STATUS" field, plus a new "ELD Status" field we add
+        # alongside it - see STATUS_FIELD_NAME_CANDIDATES' comment), and
+        # API/field order has no relation to which one we actually want.
+        # _first_match below resolves each category by CANDIDATE priority
+        # instead, so "eld status" always wins over "status" regardless of
+        # which field Asana happens to list first.
+        enum_fields_by_name = {}
+        text_number_fields_by_name = {}
         for setting in settings["data"]:
             cf = setting["custom_field"]
             subtype = cf.get("resource_subtype")
             name_lower = cf["name"].strip().lower()
+            if subtype == "enum":
+                enum_fields_by_name.setdefault(name_lower, cf)
+            elif subtype in ("text", "number"):
+                text_number_fields_by_name.setdefault(name_lower, cf)
 
-            if subtype == "enum" and field_gid is None and name_lower in STATUS_FIELD_NAME_CANDIDATES:
-                field_gid = cf["gid"]
-                field_name = cf["name"]
-                for opt in cf.get("enum_options", []):
-                    if not opt.get("enabled", True):
-                        # A disabled option can't actually be set - Asana
-                        # rejects the whole request with a 400 if we try.
-                        # Treating it as if it doesn't exist at all lets the
-                        # normal "no matching dropdown option" warning handle
-                        # it instead of failing the update outright.
-                        continue
-                    # Index both the exact name and a lower-cased version,
-                    # so an exact match is tried first and a case-insensitive
-                    # match is the fallback.
-                    options[opt["name"]] = opt["gid"]
-                    options[opt["name"].strip().lower()] = opt["gid"]
-                    # Also register our own standard status word as an
-                    # alias, if this option is a recognized abbreviation of
-                    # it (see STATUS_ABBREVIATION_ALIASES) - lets us write
-                    # to a project whose options are abbreviated instead of
-                    # spelled out in full.
-                    alias = STATUS_ABBREVIATION_ALIASES.get(_clean_option_label(opt["name"]))
-                    if alias:
-                        options[alias] = opt["gid"]
-            elif subtype in ("text", "number") and vehicle_field_gid is None and name_lower in VEHICLE_FIELD_NAME_CANDIDATES:
-                vehicle_field_gid = cf["gid"]
-                vehicle_field_type = subtype
-            elif subtype == "enum" and violation_field_gid is None and name_lower in VIOLATION_FIELD_NAME_CANDIDATES:
-                violation_field_gid = cf["gid"]
-                for opt in cf.get("enum_options", []):
-                    if not opt.get("enabled", True):
-                        continue
-                    violation_options[opt["name"]] = opt["gid"]
-                    violation_options[opt["name"].strip().lower()] = opt["gid"]
-            elif subtype == "enum" and staff_id_field_gid is None and name_lower in STAFF_ID_FIELD_NAME_CANDIDATES:
-                staff_id_field_gid = cf["gid"]
-                for opt in cf.get("enum_options", []):
-                    if not opt.get("enabled", True):
-                        continue
-                    staff_id_options[opt["name"]] = opt["gid"]
-                    staff_id_options[opt["name"].strip().lower()] = opt["gid"]
-            elif subtype == "enum" and staff_history_field_gid is None and name_lower in STAFF_HISTORY_FIELD_NAME_CANDIDATES:
-                staff_history_field_gid = cf["gid"]
-                for opt in cf.get("enum_options", []):
-                    if not opt.get("enabled", True):
-                        continue
-                    staff_history_options[opt["name"]] = opt["gid"]
-                    staff_history_options[opt["name"].strip().lower()] = opt["gid"]
+        def _first_match(candidates, fields_by_name):
+            for candidate in candidates:
+                cf = fields_by_name.get(candidate)
+                if cf is not None:
+                    return cf
+            return None
+
+        def _index_enum_options(cf):
+            indexed = {}
+            for opt in cf.get("enum_options", []):
+                if not opt.get("enabled", True):
+                    # A disabled option can't actually be set - Asana
+                    # rejects the whole request with a 400 if we try.
+                    # Treating it as if it doesn't exist at all lets the
+                    # normal "no matching dropdown option" warning handle
+                    # it instead of failing the update outright.
+                    continue
+                # Index both the exact name and a lower-cased version, so an
+                # exact match is tried first and a case-insensitive match is
+                # the fallback.
+                indexed[opt["name"]] = opt["gid"]
+                indexed[opt["name"].strip().lower()] = opt["gid"]
+            return indexed
+
+        field_gid = None
+        field_name = None
+        options = {}
+        status_cf = _first_match(STATUS_FIELD_NAME_CANDIDATES, enum_fields_by_name)
+        if status_cf is not None:
+            field_gid = status_cf["gid"]
+            field_name = status_cf["name"]
+            options = _index_enum_options(status_cf)
+            # Also register our own standard status word as an alias, for
+            # each option that's a recognized abbreviation of it (see
+            # STATUS_ABBREVIATION_ALIASES) - lets us write to a project
+            # whose options are abbreviated instead of spelled out in full.
+            for opt in status_cf.get("enum_options", []):
+                if not opt.get("enabled", True):
+                    continue
+                alias = STATUS_ABBREVIATION_ALIASES.get(_clean_option_label(opt["name"]))
+                if alias:
+                    options[alias] = opt["gid"]
+
+        vehicle_field_gid = None
+        vehicle_field_type = None
+        vehicle_cf = _first_match(VEHICLE_FIELD_NAME_CANDIDATES, text_number_fields_by_name)
+        if vehicle_cf is not None:
+            vehicle_field_gid = vehicle_cf["gid"]
+            vehicle_field_type = vehicle_cf.get("resource_subtype")
+
+        violation_field_gid = None
+        violation_options = {}
+        violation_cf = _first_match(VIOLATION_FIELD_NAME_CANDIDATES, enum_fields_by_name)
+        if violation_cf is not None:
+            violation_field_gid = violation_cf["gid"]
+            violation_options = _index_enum_options(violation_cf)
+
+        staff_id_field_gid = None
+        staff_id_options = {}
+        staff_id_cf = _first_match(STAFF_ID_FIELD_NAME_CANDIDATES, enum_fields_by_name)
+        if staff_id_cf is not None:
+            staff_id_field_gid = staff_id_cf["gid"]
+            staff_id_options = _index_enum_options(staff_id_cf)
+
+        staff_history_field_gid = None
+        staff_history_options = {}
+        staff_history_cf = _first_match(STAFF_HISTORY_FIELD_NAME_CANDIDATES, enum_fields_by_name)
+        if staff_history_cf is not None:
+            staff_history_field_gid = staff_history_cf["gid"]
+            staff_history_options = _index_enum_options(staff_history_cf)
 
         if field_gid is None:
             raise RuntimeError(
@@ -855,11 +890,20 @@ class AsanaClient:
                 if key not in field_gids and name_lower in candidates:
                     field_gids[key] = cf["gid"]
 
-        missing = [k for k in DATABASE_FIELD_NAME_CANDIDATES if k not in field_gids]
-        if missing:
+        # Every field here is optional, same as the dispatch boards' Violation/
+        # Staff ID (2026-09-22, for a team whose own pre-existing Database
+        # board uses a different shape - e.g. one combined "User/ Pass" field
+        # instead of separate Login/Password, no Co-Driver or State column at
+        # all) - create_database_task/update_database_task below only ever
+        # write a field that's actually present, so a missing one is simply
+        # skipped rather than blocking the whole board. Only raise if NONE of
+        # the 8 were found at all - that's the real "wrong project" signal
+        # (see check_asana_project's caller for how onboarding still confirms
+        # a linked project makes sense before saving it).
+        if not field_gids:
             raise RuntimeError(
-                f"Database board project '{project_name}' ({project_id}) is "
-                f"missing expected custom field(s): {missing}"
+                f"Database board project '{project_name}' ({project_id}) has "
+                f"none of the expected custom fields: {list(DATABASE_FIELD_NAME_CANDIDATES)}"
             )
 
         config = {
@@ -984,7 +1028,7 @@ class AsanaClient:
         custom_fields = {
             field_gids[key]: value
             for key, value in self._database_desired_values(record).items()
-            if value is not None or key not in self._SKIP_WHEN_SOURCE_EMPTY
+            if key in field_gids and (value is not None or key not in self._SKIP_WHEN_SOURCE_EMPTY)
         }
         self._request(
             "PUT",
@@ -1005,6 +1049,8 @@ class AsanaClient:
 
         custom_fields = {}
         for key, new_value in self._database_desired_values(record).items():
+            if key not in field_gids:
+                continue
             if new_value is None and key in self._SKIP_WHEN_SOURCE_EMPTY:
                 continue
             if existing["current"].get(key) != new_value:
