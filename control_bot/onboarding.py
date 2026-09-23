@@ -24,10 +24,20 @@ STATE_ASK_LEADER_TENANT = "ASK_LEADER_TENANT"
 STATE_ASK_ASANA_TOKEN = "ASK_ASANA_TOKEN"
 STATE_ASK_WORKSPACE_CHOICE = "ASK_WORKSPACE_CHOICE"
 STATE_ASK_ORG_TEAM_CHOICE = "ASK_ORG_TEAM_CHOICE"
-STATE_ASK_BOARD_NAMES = "ASK_BOARD_NAMES"
-STATE_ASK_DATABASE_BOARD = "ASK_DATABASE_BOARD"
+STATE_ASK_BOARD_COUNT = "ASK_BOARD_COUNT"
+STATE_ASK_BOARDS_EXIST = "ASK_BOARDS_EXIST"
+STATE_ASK_BOARD_LINKS = "ASK_BOARD_LINKS"
+STATE_ASK_TEMPLATE_LINK = "ASK_TEMPLATE_LINK"
+STATE_ASK_DATABASE_COUNT = "ASK_DATABASE_COUNT"
+STATE_ASK_DATABASE_LINK = "ASK_DATABASE_LINK"
 STATE_ASK_STAFF_ROSTER = "ASK_STAFF_ROSTER"
 STATE_CONFIRM = "CONFIRM"
+
+# Auto-generated dispatch board name suffixes when creating fresh boards
+# from a template (see _handle_boards_exist's "no" branch) - onboarding
+# never asks for names in that path, unlike the old free-text board-names
+# step this replaced.
+_BOARD_NAME_LETTERS = "ABCDEFGH"
 
 # "David: D195" / "David - D195" / "David, D195" - one staff roster entry
 # per line, name then code, any of a few common separators. Reused by
@@ -40,7 +50,7 @@ _ROSTER_LINE_PATTERN = re.compile(r"^\s*([A-Za-z][A-Za-z\-' ]*)\s*[:,\-]\s*([A-Z
 # <project_id>/...") or a bare numeric project id - most teams already have
 # a Database board with real driver history, so onboarding asks for the
 # existing one instead of always creating a brand-new empty one (see
-# _ask_database_board/provisioning.py's provision_team).
+# _ask_database_count/_handle_database_link/provisioning.py's provision_team).
 _ASANA_PROJECT_URL_PATTERN = re.compile(r"/project/(\d+)")
 
 
@@ -123,8 +133,12 @@ class OnboardingManager:
             STATE_ASK_ASANA_TOKEN: self._handle_asana_token,
             STATE_ASK_WORKSPACE_CHOICE: self._handle_workspace_choice,
             STATE_ASK_ORG_TEAM_CHOICE: self._handle_org_team_choice,
-            STATE_ASK_BOARD_NAMES: self._handle_board_names,
-            STATE_ASK_DATABASE_BOARD: self._handle_database_board,
+            STATE_ASK_BOARD_COUNT: self._handle_board_count,
+            STATE_ASK_BOARDS_EXIST: self._handle_boards_exist,
+            STATE_ASK_BOARD_LINKS: self._handle_board_links,
+            STATE_ASK_TEMPLATE_LINK: self._handle_template_link,
+            STATE_ASK_DATABASE_COUNT: self._handle_database_count,
+            STATE_ASK_DATABASE_LINK: self._handle_database_link,
             STATE_ASK_STAFF_ROSTER: self._handle_staff_roster,
             STATE_CONFIRM: self._handle_confirm,
         }.get(state)
@@ -136,26 +150,43 @@ class OnboardingManager:
 
     def handle_callback(self, chat_id, sender_id, callback_data):
         """Entry point for a tapped inline-keyboard button during
-        onboarding (see router.py's _handle_callback_query). Reuses the
-        exact same _handle_workspace_choice/_handle_org_team_choice index
-        parsing the text-reply path already had - callback_data carries a
-        0-based index ("onboard_workspace:2"), converted to the 1-based
-        text form those methods expect, so the underlying logic isn't
+        onboarding (see router.py's _handle_callback_query).
+
+        Two different callback shapes, both routed through the SAME
+        handler a typed reply would use, so the underlying logic is never
         duplicated between the button and (still-supported, in case
-        someone types a number out of habit) text paths."""
+        someone types instead of tapping) text paths:
+        - "onboard_workspace:2" / "onboard_orgteam:1" - a 0-based index
+          into a dynamic choice list, converted to the 1-based text form
+          those two handlers expect.
+        - "onboard_boardcount:3" / "onboard_boardsexist:yes" /
+          "onboard_dbcount:back" - a literal payload (a number, yes/no, or
+          "back"), passed straight through as-is - these handlers parse
+          plain text themselves, so there's no index to convert."""
         session = self.config_store.get_onboarding_session(chat_id)
         if session is None:
             return
         state, data = session
-        prefix, _, index_str = callback_data.partition(":")
-        try:
-            one_based = str(int(index_str) + 1)
-        except ValueError:
-            return
+        prefix, _, payload = callback_data.partition(":")
+
         if prefix == "onboard_workspace" and state == STATE_ASK_WORKSPACE_CHOICE:
+            try:
+                one_based = str(int(payload) + 1)
+            except ValueError:
+                return
             self._handle_workspace_choice(chat_id, sender_id, data, one_based)
         elif prefix == "onboard_orgteam" and state == STATE_ASK_ORG_TEAM_CHOICE:
+            try:
+                one_based = str(int(payload) + 1)
+            except ValueError:
+                return
             self._handle_org_team_choice(chat_id, sender_id, data, one_based)
+        elif prefix == "onboard_boardcount" and state == STATE_ASK_BOARD_COUNT:
+            self._handle_board_count(chat_id, sender_id, data, payload)
+        elif prefix == "onboard_boardsexist" and state == STATE_ASK_BOARDS_EXIST:
+            self._handle_boards_exist(chat_id, sender_id, data, payload)
+        elif prefix == "onboard_dbcount" and state == STATE_ASK_DATABASE_COUNT:
+            self._handle_database_count(chat_id, sender_id, data, payload)
 
     def _advance(self, chat_id, next_state, data):
         self.config_store.save_onboarding_session(chat_id, next_state, data)
@@ -267,7 +298,7 @@ class OnboardingManager:
                 )
                 return
         data["asana_team_gid"] = None
-        self._ask_board_names(chat_id, data)
+        self._ask_board_count(chat_id, data)
 
     def _handle_org_team_choice(self, chat_id, sender_id, data, text):
         choices = data.get("_org_team_choices", [])
@@ -278,63 +309,187 @@ class OnboardingManager:
             return
         data["asana_team_gid"] = chosen["gid"]
         data.pop("_org_team_choices", None)
-        self._ask_board_names(chat_id, data)
+        self._ask_board_count(chat_id, data)
 
-    def _ask_board_names(self, chat_id, data):
-        self._advance(chat_id, STATE_ASK_BOARD_NAMES, data)
-        self.gateway.send_message(
+    # ---------- dispatch boards: how many, existing vs. template-created ----------
+
+    def _ask_board_count(self, chat_id, data):
+        self._advance(chat_id, STATE_ASK_BOARD_COUNT, data)
+        buttons = [(str(n), f"onboard_boardcount:{n}") for n in (1, 2, 3, 4)]
+        self.gateway.send_buttons(chat_id, "How many dispatch boards do you have?", buttons)
+
+    def _handle_board_count(self, chat_id, sender_id, data, text):
+        try:
+            count = int(text.strip())
+        except ValueError:
+            count = None
+        if count not in (1, 2, 3, 4):
+            self.gateway.send_message(chat_id, "Please pick a number from the buttons (1-4).")
+            return
+        data["dispatch_board_count"] = count
+        self._ask_boards_exist(chat_id, data)
+
+    def _ask_boards_exist(self, chat_id, data):
+        self._advance(chat_id, STATE_ASK_BOARDS_EXIST, data)
+        buttons = [
+            ("Yes, I have them", "onboard_boardsexist:yes"),
+            ("No, create new", "onboard_boardsexist:no"),
+            ("« Back", "onboard_boardsexist:back"),
+        ]
+        self.gateway.send_buttons(
             chat_id,
-            "How many dispatch boards do you want, and what should each be "
-            "named? Send one board name per line, e.g.:\n"
-            "Texas A\nTexas B\nTexas C\n\n"
-            "Or just send a single name for one board (most teams only "
-            "need one to start - you're not locked in, boards can't be "
-            "renamed later through the bot but ask an admin if you need "
-            "to add more down the line).",
+            f"Do you already have {data['dispatch_board_count']} board(s) created in Asana?",
+            buttons,
         )
 
-    def _handle_board_names(self, chat_id, sender_id, data, text):
-        board_names = [line.strip() for line in text.splitlines() if line.strip()]
-        if not board_names:
-            self.gateway.send_message(chat_id, "Please send at least one board name.")
+    def _handle_boards_exist(self, chat_id, sender_id, data, text):
+        lowered = text.strip().lower()
+        if lowered == "back":
+            self._ask_board_count(chat_id, data)
             return
-        data["dispatch_board_names"] = board_names
-        self._ask_database_board(chat_id, data)
+        if lowered not in ("yes", "no"):
+            self.gateway.send_message(chat_id, "Please tap Yes or No.")
+            return
+        data["dispatch_boards_exist"] = (lowered == "yes")
+        if lowered == "yes":
+            self._advance(chat_id, STATE_ASK_BOARD_LINKS, data)
+            self.gateway.send_message(
+                chat_id,
+                f"Paste the link (or project ID) for each of your {data['dispatch_board_count']} "
+                "board(s), one per line.",
+            )
+        else:
+            self._advance(chat_id, STATE_ASK_TEMPLATE_LINK, data)
+            self.gateway.send_message(
+                chat_id,
+                "Paste the link (or project ID) of an existing board - yours or "
+                "another team's - to use as a template. Your new board(s) will get "
+                "the exact same columns, as a fresh copy (editing one later never "
+                "affects the other).",
+            )
 
-    def _ask_database_board(self, chat_id, data):
-        self._advance(chat_id, STATE_ASK_DATABASE_BOARD, data)
-        self.gateway.send_message(
-            chat_id,
-            "Do you already have a Database board in Asana (a permanent "
-            "record of every driver, active or inactive)? If so, paste its "
-            "project link or ID and syncing will only ever add new drivers "
-            "to it - your existing history is never touched or rewritten. "
-            "Send /skip if you don't have one yet and want a new one created.",
-        )
-
-    def _handle_database_board(self, chat_id, sender_id, data, text):
-        if text.lower() == "/skip":
-            data["existing_database_project_id"] = None
-            self._ask_staff_roster(chat_id, data)
+    def _handle_board_links(self, chat_id, sender_id, data, text):
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        needed = data["dispatch_board_count"]
+        project_ids = []
+        for line in lines:
+            project_id = _parse_asana_project_ref(line)
+            if project_id is None:
+                self.gateway.send_message(
+                    chat_id, f"Couldn't read a link/ID from '{line}' - paste all {needed} again, one per line.",
+                )
+                return
+            project_ids.append(project_id)
+        if len(project_ids) != needed:
+            self.gateway.send_message(
+                chat_id,
+                f"That's {len(project_ids)} link(s), but you said {needed} board(s) - "
+                f"paste all {needed}, one per line.",
+            )
             return
 
+        names = []
+        for project_id in project_ids:
+            ok, result = self.validators.check_asana_project(data["asana_token"], project_id)
+            if not ok:
+                self.gateway.send_message(
+                    chat_id, f"Couldn't access project {project_id}: {result}\n\nPaste all {needed} links again.",
+                )
+                return
+            names.append(result)
+
+        data["existing_dispatch_project_ids"] = project_ids
+        data["dispatch_board_names"] = names
+        self.gateway.send_message(chat_id, f"Found: {', '.join(names)}.")
+        self._ask_database_count(chat_id, data)
+
+    def _handle_template_link(self, chat_id, sender_id, data, text):
         project_id = _parse_asana_project_ref(text)
         if project_id is None:
-            self.gateway.send_message(
-                chat_id, "Couldn't read a project link or ID from that - paste it again, or /skip.",
-            )
+            self.gateway.send_message(chat_id, "Couldn't read a link or ID from that - paste it again.")
             return
-
         ok, result = self.validators.check_asana_project(data["asana_token"], project_id)
         if not ok:
-            self.gateway.send_message(
-                chat_id, f"Couldn't access that project: {result}\n\nPaste the link/ID again, or /skip.",
-            )
+            self.gateway.send_message(chat_id, f"Couldn't access that project: {result}\n\nPaste the link again.")
             return
+        data["template_dispatch_project_id"] = project_id
+        data["dispatch_board_names"] = [
+            f"{data['team_name']} {_BOARD_NAME_LETTERS[i]}" if data["dispatch_board_count"] > 1 else data["team_name"]
+            for i in range(data["dispatch_board_count"])
+        ]
+        self.gateway.send_message(chat_id, f"Using '{result}' as the template.")
+        self._ask_database_count(chat_id, data)
 
-        data["existing_database_project_id"] = project_id
-        self.gateway.send_message(chat_id, f"Found it: '{result}'.")
-        self._ask_staff_roster(chat_id, data)
+    # ---------- Database board(s): how many, then a link (or /skip) for each ----------
+
+    def _ask_database_count(self, chat_id, data):
+        self._advance(chat_id, STATE_ASK_DATABASE_COUNT, data)
+        buttons = [
+            ("1", "onboard_dbcount:1"),
+            ("2", "onboard_dbcount:2"),
+            ("« Back", "onboard_dbcount:back"),
+        ]
+        self.gateway.send_buttons(
+            chat_id,
+            "How many Database boards do you have (a permanent record of every "
+            "driver, active or inactive)?",
+            buttons,
+        )
+
+    def _handle_database_count(self, chat_id, sender_id, data, text):
+        lowered = text.strip().lower()
+        if lowered == "back":
+            self._ask_boards_exist(chat_id, data)
+            return
+        try:
+            count = int(lowered)
+        except ValueError:
+            count = None
+        if count not in (1, 2):
+            self.gateway.send_message(chat_id, "Please pick 1 or 2 from the buttons.")
+            return
+        data["database_board_count"] = count
+        data["existing_database_project_ids"] = []
+        self._ask_next_database_link(chat_id, data)
+
+    def _ask_next_database_link(self, chat_id, data):
+        self._advance(chat_id, STATE_ASK_DATABASE_LINK, data)
+        total = data["database_board_count"]
+        index = len(data["existing_database_project_ids"]) + 1
+        label = f"Database board {index}/{total}" if total > 1 else "Database board"
+        self.gateway.send_message(
+            chat_id,
+            f"{label}: paste its project link or ID and syncing will only ever add "
+            "new drivers to it - your existing history is never touched or "
+            "rewritten. Send /skip if you don't have one yet and want a new one "
+            "created.",
+        )
+
+    def _handle_database_link(self, chat_id, sender_id, data, text):
+        if text.lower() == "/skip":
+            data["existing_database_project_ids"].append(None)
+        else:
+            project_id = _parse_asana_project_ref(text)
+            if project_id is None:
+                self.gateway.send_message(
+                    chat_id, "Couldn't read a project link or ID from that - paste it again, or /skip.",
+                )
+                return
+
+            ok, result = self.validators.check_asana_project(data["asana_token"], project_id)
+            if not ok:
+                self.gateway.send_message(
+                    chat_id, f"Couldn't access that project: {result}\n\nPaste the link/ID again, or /skip.",
+                )
+                return
+
+            data["existing_database_project_ids"].append(project_id)
+            self.gateway.send_message(chat_id, f"Found it: '{result}'.")
+
+        if len(data["existing_database_project_ids"]) < data["database_board_count"]:
+            self._ask_next_database_link(chat_id, data)
+        else:
+            self._ask_staff_roster(chat_id, data)
 
     def _ask_staff_roster(self, chat_id, data):
         self._advance(chat_id, STATE_ASK_STAFF_ROSTER, data)
@@ -358,18 +513,26 @@ class OnboardingManager:
                 return
         data["staff_roster"] = roster
         self._advance(chat_id, STATE_CONFIRM, data)
-        database_board_line = (
-            f"Database board: existing project {data['existing_database_project_id']}"
-            if data.get("existing_database_project_id")
-            else "Database board: new one will be created"
+
+        if data.get("dispatch_boards_exist"):
+            dispatch_line = f"Dispatch board(s): using existing - {', '.join(data['dispatch_board_names'])}"
+        else:
+            dispatch_line = (
+                f"Dispatch board(s): {data['dispatch_board_count']} new board(s) "
+                f"({', '.join(data['dispatch_board_names'])}), shaped like template "
+                f"project {data['template_dispatch_project_id']}"
+            )
+        database_lines = "\n".join(
+            f"Database board {i}: existing project {pid}" if pid else f"Database board {i}: new one will be created"
+            for i, pid in enumerate(data["existing_database_project_ids"], 1)
         )
         summary = (
             f"Team: {data['team_name']}\n"
             f"Factor ELD: {'configured' if data.get('factor_session_token') else 'skipped'}\n"
             f"Leader ELD: {'configured' if data.get('leader_session_token') else 'skipped'}\n"
             f"Asana workspace: {data['workspace_gid']}\n"
-            f"Dispatch board(s): {', '.join(data['dispatch_board_names'])}\n"
-            f"{database_board_line}\n"
+            f"{dispatch_line}\n"
+            f"{database_lines}\n"
             f"Staff roster entries: {len(roster)}\n\n"
             "Reply /confirm to create your boards now, or /cancel to start over."
         )

@@ -205,17 +205,25 @@ def run_team_cycle(config_store, bot_token, team_id, state, logger):
             asana_2=state.asana_client_2,
         )
 
-        database_project_id = team.get("asana_database_project_id")
-        if database_project_id and (
+        # Up to 2 Database boards (onboarding's "how many Database boards
+        # do you have - 1 or 2" choice, 2026-09-23) - when a team has a
+        # second one, it gets the exact same full driver list mirrored onto
+        # it too, not a split between them. Both share the one
+        # last_database_sync timer, so they're always refreshed together.
+        database_project_ids = [
+            pid for pid in (team.get("asana_database_project_id"), team.get("asana_database_project_id_2")) if pid
+        ]
+        if database_project_ids and (
             time.time() - state.last_database_sync >= sync.DATABASE_SYNC_INTERVAL_SECONDS
         ):
-            sync.run_database_cycle(
-                state.asana_client, database_project_id, control, token_state=state.token_state,
-                factor_session_token=team.get("factor_session_token"),
-                factor_tenant_id=team.get("factor_tenant_id"),
-                leader_session_token=team.get("leader_session_token"),
-                leader_tenant_id=team.get("leader_tenant_id"),
-            )
+            for database_project_id in database_project_ids:
+                sync.run_database_cycle(
+                    state.asana_client, database_project_id, control, token_state=state.token_state,
+                    factor_session_token=team.get("factor_session_token"),
+                    factor_tenant_id=team.get("factor_tenant_id"),
+                    leader_session_token=team.get("leader_session_token"),
+                    leader_tenant_id=team.get("leader_tenant_id"),
+                )
             state.last_database_sync = time.time()
     except Exception:
         logger.exception(

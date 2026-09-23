@@ -1480,6 +1480,79 @@ class AsanaClient:
         self.logger.info("Bootstrapped new dispatch board '%s' (project %s).", name, project_id)
         return project_id
 
+    def _create_custom_field_like(self, workspace_gid, name, subtype, option_names=None):
+        """Create a brand-new workspace-level custom field matching a given
+        name/subtype (and, for enum/multi_enum, option names in order) -
+        used by bootstrap_dispatch_project_from_template to replicate a
+        template project's field LAYOUT without ever reusing the template's
+        own field gid (a workspace-level custom field shared between two
+        projects would mean editing one project's dropdown options changes
+        the other's too - never what "shaped like" should mean here).
+        Returns the new field's gid. date/people fields (never seen on a
+        real dispatch board so far) raise ValueError rather than silently
+        creating something wrong - the caller skips and logs those."""
+        if subtype in ("enum", "multi_enum"):
+            names = list(option_names) if option_names else ["(none yet)"]
+            data = {
+                "workspace": workspace_gid, "name": name, "resource_subtype": subtype,
+                "enum_options": [{"name": n} for n in names],
+            }
+        elif subtype == "text":
+            data = {"workspace": workspace_gid, "name": name, "resource_subtype": "text"}
+        elif subtype == "number":
+            data = {"workspace": workspace_gid, "name": name, "resource_subtype": "number", "precision": 0}
+        else:
+            raise ValueError(f"unsupported custom field subtype {subtype!r}")
+        field = self._request("POST", f"{ASANA_API_BASE}/custom_fields", json={"data": data})
+        return field["data"]["gid"]
+
+    def bootstrap_dispatch_project_from_template(self, workspace_gid, name, template_project_id, team_gid=None):
+        """Create one brand-new dispatch board, copying its custom field
+        LAYOUT (name + type + enum options, in order) from an existing
+        template project - for a team that wants fresh boards shaped like
+        one they already use (their own, or another team's) rather than
+        this file's own generic Status/Vehicle Number/Staff ID default
+        (see bootstrap_dispatch_project). Every field is created brand-new
+        (see _create_custom_field_like's docstring for why) - editing an
+        option on the new board later never touches the template's own
+        field. Company sections are never copied - same as
+        bootstrap_dispatch_project, a team's own sections come from its own
+        real driver data. Returns the new project_id."""
+        settings = self._request(
+            "GET",
+            f"{ASANA_API_BASE}/projects/{template_project_id}/custom_field_settings"
+            "?opt_fields=custom_field.name,custom_field.resource_subtype,custom_field.enum_options.name",
+        )
+        project_id = self.create_project(workspace_gid, name, team_gid)
+
+        copied, skipped = 0, []
+        for setting in settings["data"]:
+            cf = setting["custom_field"]
+            subtype = cf.get("resource_subtype")
+            option_names = (
+                [o["name"] for o in cf.get("enum_options", [])] if subtype in ("enum", "multi_enum") else None
+            )
+            try:
+                field_gid = self._create_custom_field_like(workspace_gid, cf["name"], subtype, option_names)
+            except ValueError:
+                skipped.append(f"{cf['name']} ({subtype})")
+                continue
+            self.attach_custom_field(project_id, field_gid)
+            copied += 1
+
+        if skipped:
+            self.logger.warning(
+                "Bootstrapped new dispatch board '%s' (project %s) from template %s - "
+                "copied %s field(s), skipped %s unsupported field(s): %s.",
+                name, project_id, template_project_id, copied, len(skipped), skipped,
+            )
+        else:
+            self.logger.info(
+                "Bootstrapped new dispatch board '%s' (project %s) from template %s (%s field(s) copied).",
+                name, project_id, template_project_id, copied,
+            )
+        return project_id
+
     def bootstrap_database_project(self, workspace_gid, name, team_gid=None):
         """Create one brand-new Database board from scratch: the 8 text
         fields every existing Database TX task already has. Field names

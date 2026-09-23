@@ -118,6 +118,12 @@ CREATE TABLE IF NOT EXISTS seen_fmcsa_transfers (
 # existing team (nothing writes to a team's row unless asked to).
 _NEW_TEAM_COLUMNS = {
     "asana_project_ids_2": "TEXT",
+    # A second, independent Database board (2026-09-23, onboarding's
+    # "how many Database boards do you have - 1 or 2" step) - mirrors the
+    # exact same full driver list onto both when present (see
+    # multi_sync.py's run_team_cycle), same as asana_project_ids_2 mirrors
+    # a second dispatch board GROUP rather than splitting data between them.
+    "asana_database_project_id_2": "TEXT",
 }
 
 # Fields whose value is stored encrypted (as "<field>_enc") rather than

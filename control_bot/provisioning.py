@@ -53,32 +53,48 @@ class Provisioner:
         team_gid = data.get("asana_team_gid")
         team_name = data["team_name"]
 
-        # One dispatch board per name onboarding collected (see
-        # onboarding.py's _ask_board_names) - most teams send just one, but
-        # a team like "original" (Texas A/B/C) needs several. Each board
-        # gets its OWN separate Status/Vehicle Number/Violation/Staff ID
-        # fields (bootstrap_dispatch_project creates fresh ones every call,
-        # never reuses one across boards) - so a multi-board team's Staff
-        # ID roster has to be pushed to every board's own fields, see
-        # add_staff_roster_entry below for the same reason on later adds.
-        board_names = data.get("dispatch_board_names") or [f"{team_name} {_DISPATCH_BOARD_SUFFIX}"]
-        dispatch_project_ids = []
-        for board_name in board_names:
-            project_id = client.bootstrap_dispatch_project(workspace_gid, board_name, team_gid)
-            dispatch_project_ids.append(project_id)
+        # Two ways to get dispatch boards (see onboarding.py's
+        # _handle_boards_exist): either the team already has them - use the
+        # real project ids directly, exactly as given, never modified - or
+        # they don't, in which case fresh boards are created shaped like a
+        # template project the team picked (bootstrap_dispatch_project_from_
+        # template), auto-named team_name + A/B/C.../ team_name alone for
+        # just one. Either way, staff roster still needs pushing to every
+        # board's own Staff ID field (each board has its own separate
+        # field - see _populate_staff_roster's guard for when a board, e.g.
+        # an arbitrary existing one, doesn't have that field at all).
+        if data.get("dispatch_boards_exist"):
+            dispatch_project_ids = list(data["existing_dispatch_project_ids"])
+        else:
+            template_id = data["template_dispatch_project_id"]
+            dispatch_project_ids = [
+                client.bootstrap_dispatch_project_from_template(workspace_gid, board_name, template_id, team_gid)
+                for board_name in data["dispatch_board_names"]
+            ]
+        for project_id in dispatch_project_ids:
             self._populate_staff_roster(client, project_id, data.get("staff_roster") or {})
 
         # Most teams already have a Database board with real driver history
         # by the time they onboard here - reuse it (see onboarding.py's
-        # _ask_database_board) instead of creating a competing empty one.
-        # No field/name mismatch risk: _get_database_project_config already
-        # matches columns by NAME (DATABASE_FIELD_NAME_CANDIDATES), not by
-        # gid, and run_database_cycle only ever creates/updates - it never
-        # deletes or rewrites existing rows, so pointing at an existing
-        # board is exactly as safe as pointing at a brand-new one.
-        database_project_id = data.get("existing_database_project_id") or client.bootstrap_database_project(
-            workspace_gid, f"{team_name} {_DATABASE_BOARD_SUFFIX}", team_gid,
-        )
+        # _ask_database_count/_handle_database_link) instead of creating a
+        # competing empty one. No field/name mismatch risk:
+        # _get_database_project_config already matches columns by NAME
+        # (DATABASE_FIELD_NAME_CANDIDATES), not by gid, and every field is
+        # optional (2026-09-22) - and run_database_cycle only ever
+        # creates/updates, never deletes or rewrites existing rows, so
+        # pointing at an existing board is exactly as safe as a brand-new
+        # one. Up to 2 Database boards (onboarding's own "1 or 2" choice) -
+        # when a team has 2, both get the exact same full driver list
+        # mirrored onto them (see multi_sync.py's run_team_cycle), not a
+        # split between them.
+        existing_database_ids = data.get("existing_database_project_ids") or [None]
+        database_project_ids = []
+        for i, existing_id in enumerate(existing_database_ids, 1):
+            if existing_id:
+                database_project_ids.append(existing_id)
+                continue
+            suffix = f"{_DATABASE_BOARD_SUFFIX} {i}" if len(existing_database_ids) > 1 else _DATABASE_BOARD_SUFFIX
+            database_project_ids.append(client.bootstrap_database_project(workspace_gid, f"{team_name} {suffix}", team_gid))
         # Deliberately does NOT create an Odometer Jump board - it was
         # removed from both Texas and Missouri's boards (2026-09-22, user
         # request: "no need") and multi_sync.py's run_team_cycle already
@@ -93,7 +109,8 @@ class Provisioner:
             asana_team_gid=team_gid,
             asana_token=data["asana_token"],
             asana_project_ids=",".join(dispatch_project_ids),
-            asana_database_project_id=database_project_id,
+            asana_database_project_id=database_project_ids[0],
+            asana_database_project_id_2=database_project_ids[1] if len(database_project_ids) > 1 else None,
             factor_session_token=data.get("factor_session_token"),
             factor_tenant_id=data.get("factor_tenant_id"),
             leader_session_token=data.get("leader_session_token"),
@@ -158,10 +175,22 @@ class Provisioner:
         option outright. Letting that single duplicate raise would abort
         every entry after it, and (via add_dispatch_board) skip the
         config_store update entirely, orphaning an otherwise-real new
-        board. One bad/duplicate entry is logged and skipped instead."""
+        board. One bad/duplicate entry is logged and skipped instead.
+
+        Guards on staff_id_field_gid being present (2026-09-23) - a team
+        can now point onboarding at an arbitrary EXISTING board (see
+        onboarding.py's "yes, I have them" path) that may not have any
+        field recognized as Staff ID at all (e.g. it's called something
+        else entirely) - add_enum_option(None, ...) would just 404."""
         if not staff_roster:
             return
         config = client._get_project_config(dispatch_project_id)
+        if not config.get("staff_id_field_gid"):
+            self.logger.warning(
+                "Project %s has no recognized Staff ID field - skipping its roster population.",
+                dispatch_project_id,
+            )
+            return
         for first_name, code in staff_roster.items():
             try:
                 client.add_enum_option(config["staff_id_field_gid"], f"#{code}")
@@ -196,6 +225,8 @@ class Provisioner:
         client = asana_client.AsanaClient(team["asana_token"], [], self.logger)
         for project_id in _all_dispatch_project_ids(team):
             config = client._get_project_config(project_id)
+            if not config.get("staff_id_field_gid"):
+                continue  # e.g. an arbitrary existing board with no recognized Staff ID field
             client.add_enum_option(config["staff_id_field_gid"], f"#{code}")
         return roster
 
