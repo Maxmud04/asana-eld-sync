@@ -107,6 +107,13 @@ DATABASE_FIELD_NAME_CANDIDATES = {
     "state": ["state"],
     "login": ["login"],
     "password": ["password"],
+    # Some teams' own pre-existing Database boards (e.g. Central B's) use
+    # ONE combined column for what other boards split into two separate
+    # ones - recognized here as their own keys so create_database_task/
+    # update_database_task still auto-fill them for a brand-new company or
+    # driver instead of silently skipping (2026-09-24).
+    "login_password_combined": ["user/ pass", "user/pass", "user / pass"],
+    "state_cdl_combined": ["state / cdl number", "state/cdl number", "state / cdl", "state/cdl"],
 }
 
 # A task title combining two drivers can use either "&" or "|" as the
@@ -1064,6 +1071,7 @@ class AsanaClient:
         return index
 
     def _database_desired_values(self, record):
+        state_cdl_parts = [v for v in (record.state, record.cdl) if v]
         return {
             "co_driver": record.co_driver_name or None,
             "vehicle_number": vehicle_field_value("text", record.vehicle_number),
@@ -1076,12 +1084,16 @@ class AsanaClient:
             # password field (confirmed - not present anywhere in its driver
             # data), this is your team's own username=password convention.
             "password": record.login or None,
+            "login_password_combined": record.login or None,
+            "state_cdl_combined": " / ".join(state_cdl_parts) or None,
         }
 
     # Leader ELD / Factor ELD frequently return "" for these two fields even
     # when a real value has been entered by hand in Asana - never let a
     # blank upstream value clobber a manually-entered one.
-    _SKIP_WHEN_SOURCE_EMPTY = {"email", "phone_number"}
+    _SKIP_WHEN_SOURCE_EMPTY = {
+        "email", "phone_number", "login_password_combined", "state_cdl_combined",
+    }
 
     def create_database_task(self, project_id, record):
         """Create a brand-new Database board task for a driver who doesn't
