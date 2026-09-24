@@ -60,9 +60,9 @@ def _clean_option_label(name):
 # The dropdown for truck/unit number to look for, if a project has one. Not
 # every project has this field (only Maxmud Test A does, right now) - when
 # a project doesn't, we simply skip writing a vehicle number there instead
-# of treating it as an error. "truck" added 2026-09-22 for a team whose
-# pre-existing board already used that name instead.
-VEHICLE_FIELD_NAME_CANDIDATES = ["vehicle number", "truck"]
+# of treating it as an error. "truck"/"unit" added 2026-09-22/23 for teams
+# whose pre-existing boards already used those names instead.
+VEHICLE_FIELD_NAME_CANDIDATES = ["vehicle number", "truck", "unit"]
 
 # The HOS violation dropdown to look for, if a project has one. Originally
 # spelled "Woring Vilation" (typo and all); renamed in different projects to
@@ -652,6 +652,31 @@ class AsanaClient:
             json={"data": {"name": name}},
         )
         return section["data"]["gid"]
+
+    def copy_sections_from(self, source_project_id, dest_project_id):
+        """Create an empty section on dest_project_id for every company
+        section that already exists on source_project_id - for a team
+        switching from an old real board to a brand-new one built from it
+        as a template (see bootstrap_dispatch_project_from_template) that
+        wants the new board to start with the same company list instead of
+        an empty one waiting for auto-assignment to rebuild it driver by
+        driver. Deliberately copies the SECTION (the company folder) only,
+        never any task inside it - the next sync cycle creates every real
+        driver's task fresh from live Factor/Leader ELD data, so copying
+        old tasks would just create stale duplicates. Skips any name
+        already present on dest_project_id (case-insensitive) rather than
+        creating a duplicate folder. Returns how many sections were
+        created."""
+        existing = {s["name"].strip().lower() for s in self._fetch_sections(dest_project_id)}
+        created = 0
+        for section in self._fetch_sections(source_project_id):
+            name = (section.get("name") or "").strip()
+            if not name or name.lower() in existing:
+                continue
+            self.create_section(dest_project_id, name)
+            existing.add(name.lower())
+            created += 1
+        return created
 
     def list_section_task_gids(self, section_gid):
         """Every task gid currently in one section, in ANY project - used
@@ -1490,9 +1515,27 @@ class AsanaClient:
         the other's too - never what "shaped like" should mean here).
         Returns the new field's gid. date/people fields (never seen on a
         real dispatch board so far) raise ValueError rather than silently
-        creating something wrong - the caller skips and logs those."""
+        creating something wrong - the caller skips and logs those.
+
+        For enum/multi_enum, de-duplicates option_names case-insensitively
+        before creating - confirmed live (2026-09-23) that a real template
+        field can already hold two options differing only in case (e.g.
+        "On duty" and "On Duty", both on a real messy dispatcher-notes
+        field), which Asana's own existing data tolerates but its create-
+        field endpoint outright rejects (403 "enum_option_duplicate_name_
+        at_indexes") - the first-seen casing wins, later case-only variants
+        are dropped rather than failing the whole field copy over it."""
         if subtype in ("enum", "multi_enum"):
             names = list(option_names) if option_names else ["(none yet)"]
+            seen_lower = set()
+            deduped_names = []
+            for n in names:
+                key = n.strip().lower()
+                if key in seen_lower:
+                    continue
+                seen_lower.add(key)
+                deduped_names.append(n)
+            names = deduped_names or ["(none yet)"]
             data = {
                 "workspace": workspace_gid, "name": name, "resource_subtype": subtype,
                 "enum_options": [{"name": n} for n in names],

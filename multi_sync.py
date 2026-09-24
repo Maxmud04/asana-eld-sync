@@ -91,6 +91,7 @@ class TeamRuntimeState:
     def __init__(self):
         self.asana_client = None
         self.asana_token = None  # the token asana_client was built with
+        self.asana_project_ids = None  # the project_ids asana_client was built with
         self.token_state = sync.TokenAlertState()
         self.last_database_sync = 0.0
         # Second, independent set of dispatch boards covering the same
@@ -139,9 +140,22 @@ def run_team_cycle(config_store, bot_token, team_id, state, logger):
 
     project_ids = [p.strip() for p in team["asana_project_ids"].split(",") if p.strip()]
 
-    if state.asana_client is None or state.asana_token != team["asana_token"]:
+    # Confirmed live (2026-09-24): rebuilding only on a TOKEN change missed
+    # the far more common case of an admin repointing a team's board list
+    # itself (e.g. swapping in brand-new boards, as done for centrala/
+    # Central B) without rotating the token - the running process kept
+    # silently syncing the OLD board list all night, invisible until
+    # someone checked the actual Asana data (the secondary board group
+    # below already checked its own project_ids for exactly this reason;
+    # the primary one just never got the same treatment).
+    if (
+        state.asana_client is None
+        or state.asana_token != team["asana_token"]
+        or state.asana_project_ids != project_ids
+    ):
         state.asana_client = asana_client.AsanaClient(team["asana_token"], project_ids, logger)
         state.asana_token = team["asana_token"]
+        state.asana_project_ids = project_ids
 
     project_ids_2_raw = team.get("asana_project_ids_2")
     project_ids_2 = [p.strip() for p in (project_ids_2_raw or "").split(",") if p.strip()]
