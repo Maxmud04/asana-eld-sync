@@ -1094,6 +1094,7 @@ def run_one_cycle(
     leader_session_token=None, leader_tenant_id=None,
     staff_roster=None, algo_label=None,
     asana_2=None,
+    excluded_company_names=None,
 ):
     """Fetch drivers from every ELD platform, match them to Asana tasks,
     and update anything that changed. Returns nothing - everything
@@ -1162,6 +1163,20 @@ def run_one_cycle(
         ))
     except Exception:
         logger.exception("Leader ELD fetch failed this run - continuing without it.")
+
+    if excluded_company_names:
+        # Some teams share the exact same Factor/Leader ELD tenant with
+        # another team (confirmed for real: centrala and Central B both
+        # use tenant 96335ac3.../d0e24f31...) with no company_filter
+        # separating them, so a fetch here naturally includes every
+        # company from BOTH teams. Drop the ones that belong to the OTHER
+        # team before they ever reach section-matching, so this team's
+        # boards never auto-create a section for a company that isn't
+        # actually theirs.
+        excluded_keys = {normalize_company_name(n) for n in excluded_company_names}
+        all_drivers = [
+            d for d in all_drivers if normalize_company_name(d.company_name or "") not in excluded_keys
+        ]
 
     if not all_drivers:
         logger.warning("No drivers were fetched from any platform this run.")
@@ -1290,6 +1305,7 @@ def run_database_cycle(
     asana, database_project_id, control=None, token_state=None,
     factor_session_token=None, factor_tenant_id=None,
     leader_session_token=None, leader_tenant_id=None,
+    excluded_company_names=None,
 ):
     """Sync the standalone 'Database' board: every driver (active AND
     inactive) from BOTH Factor ELD and Leader ELD (confirmed this board is
@@ -1317,6 +1333,15 @@ def run_database_cycle(
         ))
     except Exception:
         logger.exception("Leader ELD: driver database fetch failed this run.")
+
+    if excluded_company_names:
+        # See the matching comment in run_one_cycle - same shared-tenant
+        # leak, same fix, needed separately here because this board's
+        # fetch has never taken a company_filter at all.
+        excluded_keys = {normalize_company_name(n) for n in excluded_company_names}
+        records = [
+            r for r in records if normalize_company_name(r.company_name or "") not in excluded_keys
+        ]
 
     if not records:
         logger.warning("Database board: no driver records fetched - skipping this run.")

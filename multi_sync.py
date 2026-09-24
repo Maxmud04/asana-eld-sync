@@ -217,6 +217,7 @@ def run_team_cycle(config_store, bot_token, team_id, state, logger):
             staff_roster=team.get("staff_roster"),
             algo_label=team.get("algo_service_account_label") or None,
             asana_2=state.asana_client_2,
+            excluded_company_names=team.get("excluded_company_names"),
         )
 
         # Up to 2 Database boards (onboarding's "how many Database boards
@@ -237,6 +238,7 @@ def run_team_cycle(config_store, bot_token, team_id, state, logger):
                     factor_tenant_id=team.get("factor_tenant_id"),
                     leader_session_token=team.get("leader_session_token"),
                     leader_tenant_id=team.get("leader_tenant_id"),
+                    excluded_company_names=team.get("excluded_company_names"),
                 )
             state.last_database_sync = time.time()
     except Exception:
