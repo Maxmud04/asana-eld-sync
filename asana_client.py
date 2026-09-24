@@ -167,6 +167,45 @@ def normalize_company_name(name):
     return _WHITESPACE_PATTERN.sub(" ", cleaned).strip().lower()
 
 
+# Confirmed live (2026-09-24): a company name can genuinely belong to TWO
+# separate, unrelated real companies that happen to share the exact same
+# name - one on Factor ELD, a different one on Leader ELD ("Eagle Eye
+# Trucking LLC" and "Caravan Logistics LLC" both do). Since
+# normalize_company_name strips all decoration, these would otherwise
+# collide onto the same section_index key and silently merge drivers from
+# two different real companies into one section. A section tagged with
+# one of these two emoji (already present on some sections copied from an
+# older board, where a human had manually worked around this same problem)
+# is a deliberate "this section belongs to ONE platform only" signal -
+# build_section_index/company_section_keys below key it separately instead
+# of merging it with the other platform's same-named company.
+PLATFORM_EMOJI = {"Factor ELD": "🔵", "Leader ELD": "🟣"}
+
+
+def detect_section_platform(section_name):
+    """If a section's own name contains one of PLATFORM_EMOJI's emoji,
+    return that platform's label (e.g. "Factor ELD") - None if it has
+    neither (the normal, single-platform case every other company uses)."""
+    for platform, emoji in PLATFORM_EMOJI.items():
+        if emoji in (section_name or ""):
+            return platform
+    return None
+
+
+def company_section_keys(company_name, source=None):
+    """Returns (platform_key, plain_key) for looking up or indexing a
+    company's Asana section. platform_key (only non-None when source is a
+    recognized platform) must always be tried FIRST - it's the key a
+    section deliberately tagged with that platform's emoji is indexed
+    under (see PLATFORM_EMOJI above), for a company name that collides
+    across Factor and Leader ELD. plain_key is the normal, single-platform
+    case every other company still uses, unaffected by any of this."""
+    plain_key = normalize_company_name(company_name)
+    emoji = PLATFORM_EMOJI.get(source)
+    platform_key = f"{plain_key}|{emoji}" if emoji else None
+    return platform_key, plain_key
+
+
 # Any task whose title contains this phrase is a flagged-exception task,
 # not a normal driver roster entry - we never match or update these.
 IGNORED_TASK_PHRASE = "has a problem"
@@ -605,8 +644,16 @@ class AsanaClient:
         build a lookup table from company name -> where to create a new
         task for a driver in that company.
 
-        Returns a dict: { normalized_company_name: {project_id, project_name,
-        section_gid, section_name} }
+        Returns a dict: { lookup_key: {project_id, project_name,
+        section_gid, section_name} }. lookup_key is normally just
+        normalize_company_name(section_name) - but a section whose name
+        carries a PLATFORM_EMOJI tag (see that constant and
+        company_section_keys) is indexed under its platform-specific key
+        INSTEAD, never the plain one, so a real cross-platform name
+        collision (the same company name genuinely belonging to two
+        different companies, one per platform) can never merge them -
+        callers must use company_section_keys(name, driver.source) to look
+        this index up correctly (see sync.py).
 
         We only use existing sections as placement targets - if a driver's
         company has no section anywhere yet, we deliberately don't guess
@@ -619,12 +666,19 @@ class AsanaClient:
                 name = (section.get("name") or "").strip()
                 if not name:
                     continue
-                index[normalize_company_name(name)] = {
+                section_info = {
                     "project_id": project_id,
                     "project_name": config["name"],
                     "section_gid": section["gid"],
                     "section_name": name,
                 }
+                platform = detect_section_platform(name)
+                if platform:
+                    platform_key, _ = company_section_keys(name, platform)
+                    index[platform_key] = section_info
+                else:
+                    _, plain_key = company_section_keys(name)
+                    index[plain_key] = section_info
         return index
 
     def get_project_names(self, project_ids=None):

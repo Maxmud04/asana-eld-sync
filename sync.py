@@ -39,7 +39,9 @@ import eld_factor
 import eld_leader
 import telegram_control
 import telegram_notifier
-from asana_client import normalize_company_name, normalize_name, vehicle_field_value, word_sort_key
+from asana_client import (
+    company_section_keys, normalize_company_name, normalize_name, vehicle_field_value, word_sort_key,
+)
 from eld_common import higher_priority_status
 from eld_common import invisibility_reason as compute_invisibility_reason
 
@@ -71,6 +73,21 @@ logging.basicConfig(
 logger = logging.getLogger("sync")
 
 
+def _lookup_section(section_index, company_name, source):
+    """Find company_name's existing Asana section: a platform-specific
+    match (a section tagged for this exact platform, see
+    asana_client.PLATFORM_EMOJI - only relevant for a company name that
+    genuinely collides across Factor and Leader ELD) first, falling back
+    to the plain, single-platform key every other company still uses.
+    Every section_index lookup in this file goes through this one
+    function, so the platform-vs-plain priority is never applied
+    inconsistently between call sites."""
+    platform_key, plain_key = company_section_keys(company_name, source)
+    if platform_key and platform_key in section_index:
+        return section_index[platform_key]
+    return section_index.get(plain_key)
+
+
 def _lookup_matches(name, task_index, fallback_index):
     """Find a name's existing Asana task(s): exact match first, then the
     word-order-independent fallback (see asana_client.word_sort_key)."""
@@ -80,7 +97,7 @@ def _lookup_matches(name, task_index, fallback_index):
     return matches
 
 
-def _auto_assign_new_company(asana, company_name, section_index, logger):
+def _auto_assign_new_company(asana, company_name, section_index, logger, source=None):
     """A company Factor/Leader ELD reports that has no section on ANY of
     this board group's boards yet - create one on a board picked
     uniformly at random from asana.project_ids (2026-09-22, user-
@@ -93,26 +110,52 @@ def _auto_assign_new_company(asana, company_name, section_index, logger):
     SAME cycle finds the section that was just created instead of each
     creating their own duplicate. Returns the new section_info dict
     (same shape section_index already holds), or None if creation
-    failed (logged, caller falls back to its own "no section" handling)."""
+    failed (logged, caller falls back to its own "no section" handling).
+
+    Collision guard (2026-09-24): if a PLAIN (untagged) section for this
+    same company name already exists, this is a brand-new cross-platform
+    collision just being discovered (the same company name genuinely
+    belonging to a different real company on the other platform - see
+    asana_client.PLATFORM_EMOJI) - the new section gets tagged with this
+    driver's own platform emoji and indexed under the platform-specific
+    key instead, so it never gets treated as the same company as the
+    existing plain one. The existing plain section is left completely
+    untouched either way (see the module note on PLATFORM_EMOJI for why
+    guessing which platform IT belongs to would be unsafe)."""
+    _, plain_key = asana_client.company_section_keys(company_name)
+    emoji = asana_client.PLATFORM_EMOJI.get(source)
+    tag_this_new_section = emoji and plain_key in section_index
+    display_name = f"{company_name}{emoji}" if tag_this_new_section else company_name
+
     project_id = random.choice(asana.project_ids)
     try:
-        section_gid = asana.create_section(project_id, company_name)
+        section_gid = asana.create_section(project_id, display_name)
     except Exception:
         logger.exception(
             "Failed to auto-create a section for new company '%s' on project %s.",
-            company_name, project_id,
+            display_name, project_id,
         )
         return None
     project_name = asana.get_project_names([project_id]).get(project_id, project_id)
     section_info = {
         "project_id": project_id, "project_name": project_name,
-        "section_gid": section_gid, "section_name": company_name,
+        "section_gid": section_gid, "section_name": display_name,
     }
-    section_index[normalize_company_name(company_name)] = section_info
-    logger.info(
-        "New company '%s' - auto-created a section on '%s' (no admin action needed).",
-        company_name, project_name,
-    )
+    if tag_this_new_section:
+        platform_key, _ = asana_client.company_section_keys(company_name, source)
+        section_index[platform_key] = section_info
+        logger.warning(
+            "New company '%s' collides by name with an existing section on a "
+            "different platform - auto-created a SEPARATE, tagged section "
+            "('%s') on '%s' instead of merging them.",
+            company_name, display_name, project_name,
+        )
+    else:
+        section_index[plain_key] = section_info
+        logger.info(
+            "New company '%s' - auto-created a section on '%s' (no admin action needed).",
+            company_name, project_name,
+        )
     return section_info
 
 
@@ -671,7 +714,7 @@ def _sync_dispatch_board_group(
             # for drivers who are both active AND have a vehicle assigned in
             # Factor ELD - there's no value in cluttering Asana with a task
             # for someone who isn't actually on a truck right now.
-            section_info = section_index.get(normalize_company_name(driver.company_name))
+            section_info = _lookup_section(section_index, driver.company_name, driver.source)
             if invisibility_reason is not None:
                 not_found_count += 1
                 logger.info(
@@ -682,7 +725,7 @@ def _sync_dispatch_board_group(
             else:
                 if section_info is None:
                     section_info = _auto_assign_new_company(
-                        asana, driver.company_name, section_index, logger,
+                        asana, driver.company_name, section_index, logger, source=driver.source,
                     )
                 if section_info is None:
                     not_found_count += 1
@@ -752,7 +795,7 @@ def _sync_dispatch_board_group(
                 # driver's own task (same name, different real company) -
                 # see visible_driver_keys. Never move or overwrite it.
                 continue
-            correct_section_info = section_index.get(normalize_company_name(driver.company_name))
+            correct_section_info = _lookup_section(section_index, driver.company_name, driver.source)
             if (
                 correct_section_info is not None
                 and match.get("current_section_gid")
@@ -853,7 +896,7 @@ def _sync_dispatch_board_group(
             for name in unit["member_names"]:
                 names_with_a_task.add(normalize_name(name))
 
-            correct_section_info = section_index.get(normalize_company_name(unit["company_name"]))
+            correct_section_info = _lookup_section(section_index, unit["company_name"], unit["source"])
             if (
                 correct_section_info is not None
                 and match.get("current_section_gid")
@@ -941,9 +984,11 @@ def _sync_dispatch_board_group(
             continue
 
         # No existing combined task for this exact pair yet.
-        section_info = section_index.get(normalize_company_name(unit["company_name"]))
+        section_info = _lookup_section(section_index, unit["company_name"], unit["source"])
         if section_info is None:
-            section_info = _auto_assign_new_company(asana, unit["company_name"], section_index, logger)
+            section_info = _auto_assign_new_company(
+                asana, unit["company_name"], section_index, logger, source=unit["source"],
+            )
         if section_info is None:
             not_found_count += 1
             continue
