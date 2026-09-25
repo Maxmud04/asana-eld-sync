@@ -215,7 +215,7 @@ class TeamRouter:
         data = callback_query.get("data") or ""
 
         try:
-            if data.startswith("onboard_workspace:") or data.startswith("onboard_orgteam:"):
+            if data.startswith("onboard_"):
                 self.onboarding.handle_callback(chat_id, sender_id, data)
             elif data.startswith("menu:"):
                 self._handle_menu_callback(chat_id, message_id, sender_id, data)
