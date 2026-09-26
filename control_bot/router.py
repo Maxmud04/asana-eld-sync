@@ -1000,17 +1000,21 @@ class TeamRouter:
         self.config_store.clear_onboarding_session(chat_id)
         self.provisioning.rewrite_env(team_id)
 
-        # Same reused-tenant risk onboarding.py warns about, here too - a
-        # rotation is exactly how last time's wrong-tenant mistakes got
-        # fixed, so it's just as easy to introduce a new one this way.
+        # Same reused-TOKEN risk onboarding.py's _warn_if_token_reused warns
+        # about, here too - a rotation is exactly how last time's wrong-
+        # credential mistakes got fixed, so it's just as easy to introduce a
+        # new one this way. Checks the session token, not tenant_id - every
+        # team here shares the same tenant_id by design (confirmed live,
+        # 2026-09-26), so a tenant_id match means nothing; the token is
+        # what actually scopes which companies are visible.
         other_matches = [
             t["team_name"] for t in self.config_store.list_teams()
-            if t["team_id"] != team_id and t.get(tenant_field) == new_tenant_id
+            if t["team_id"] != team_id and t.get(field_name) == data["pending_token"]
         ]
         warning = ""
         if other_matches:
             warning = (
-                f"\n\n⚠️ Heads up: this exact tenant_id is also used by "
+                f"\n\n⚠️ Heads up: this exact session token is also used by "
                 f"{', '.join(other_matches)}. If that's not intentional, rotate it "
                 "again with the correct one - this will otherwise mix that team's "
                 "companies onto this one's boards."

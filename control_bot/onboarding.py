@@ -223,7 +223,7 @@ class OnboardingManager:
             )
             return
         self.gateway.send_message(chat_id, f"Factor ELD confirmed ({message}).")
-        self._warn_if_tenant_reused(chat_id, "factor_tenant_id", data["factor_tenant_id"], "Factor ELD")
+        self._warn_if_token_reused(chat_id, "factor_session_token", data["factor_session_token"], "Factor ELD")
         self._advance(chat_id, STATE_ASK_LEADER_TOKEN, data)
         self.gateway.send_message(chat_id, "Paste your Leader ELD session token (or /skip).")
 
@@ -247,35 +247,43 @@ class OnboardingManager:
             )
             return
         self.gateway.send_message(chat_id, f"Leader ELD confirmed ({message}).")
-        self._warn_if_tenant_reused(chat_id, "leader_tenant_id", data["leader_tenant_id"], "Leader ELD")
+        self._warn_if_token_reused(chat_id, "leader_session_token", data["leader_session_token"], "Leader ELD")
         self._advance(chat_id, STATE_ASK_ASANA_TOKEN, data)
         self.gateway.send_message(chat_id, "Now paste your Asana personal access token.")
 
-    def _warn_if_tenant_reused(self, chat_id, tenant_field, tenant_id, label):
+    def _warn_if_token_reused(self, chat_id, token_field, session_token, label):
         """A token+tenant_id pair validating successfully only proves it's a
         REAL account - it says nothing about whether it's THIS team's own
         account. Confirmed live (2026-09-25/26, Central B and then ALGO D):
-        pasting another team's tenant_id by habit/mistake passes validation
-        every time and silently pulls that other team's companies onto the
-        new team's boards - the single most expensive mistake made across
-        this whole onboarding effort, each time only caught by manually
-        diffing live driver data well after boards were already created and
-        syncing. A same tenant_id can genuinely be intentional (a shared
-        ELD account), so this only warns - never blocks - but it surfaces
-        the risk at the exact moment it's still cheap to fix (before any
-        board exists yet), rather than hours later."""
-        if not tenant_id:
+        pasting another team's SESSION TOKEN by habit/mistake passes
+        validation every time and silently pulls that other team's exact
+        companies onto the new team's boards - the single most expensive
+        mistake made across this whole onboarding effort, each time only
+        caught by manually diffing live driver data well after boards were
+        already created and syncing.
+
+        This checks the TOKEN, not the tenant_id - confirmed live
+        (2026-09-26, onboarding LEADER D) that every existing team,
+        including the original two (Texas/Missouri), shares the exact same
+        factor_tenant_id/leader_tenant_id: that's this org's normal shared-
+        account architecture, not a mistake, so warning on tenant_id match
+        would fire on every single onboarding from now on and teach people
+        to ignore it. The session token is what actually scopes which
+        companies are visible - two teams sharing the same one is the real,
+        rare, expensive mistake worth flagging. Only warns, never blocks -
+        a genuinely shared token could still be intentional."""
+        if not session_token:
             return
         matches = [
             t["team_name"] for t in self.config_store.list_teams()
-            if t.get(tenant_field) == tenant_id
+            if t.get(token_field) == session_token
         ]
         if matches:
             self.gateway.send_message(
                 chat_id,
-                f"⚠️ Heads up: this exact {label} tenant_id is already used by "
+                f"⚠️ Heads up: this exact {label} session token is already used by "
                 f"{', '.join(matches)}. If that's not intentional (this should "
-                "be a DIFFERENT account for this team), send /cancel now and "
+                "be a DIFFERENT login for this team), send /cancel now and "
                 "restart with the correct one - continuing will very likely "
                 "mix that team's companies onto this one's boards.",
             )
