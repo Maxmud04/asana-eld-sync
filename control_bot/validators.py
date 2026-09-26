@@ -115,6 +115,34 @@ def check_asana_project(token, project_id):
     return True, name
 
 
+def ensure_database_project_ready(token, workspace_gid, project_id):
+    """A pasted existing Database board link resolving (check_asana_project)
+    only proves it's a real, accessible project - not that it has any field
+    run_database_cycle can actually write into. Confirmed live (2026-09-26,
+    onboarding LEADER D): a genuinely blank placeholder project (zero
+    custom fields at all) passed onboarding fine, then every single sync
+    cycle afterward silently failed to read it forever (caught by
+    run_database_cycle's own try/except, logged and skipped - no one would
+    ever notice short of manually checking). If _get_database_project_config
+    finds NONE of the 8 standard fields, auto-attach them (exactly what
+    bootstrap_database_project puts on a brand-new board) rather than
+    rejecting the board outright - a team's already-real, differently-
+    shaped Database board (e.g. Central B's combined User/Pass column)
+    still resolves normally and is left untouched here. Returns True if any
+    fields were just attached (worth telling the admin about), False if the
+    board already had usable fields."""
+    client = asana_client.AsanaClient(token, [], _logger)
+    try:
+        client._get_database_project_config(project_id)
+        return False  # already has at least one usable field - untouched
+    except RuntimeError:
+        pass
+    for field_name in ["Co-driver", "Vehicle Id", "Email", "Phone Number", "CDL", "State", "Login", "Password"]:
+        field_gid = client.create_text_custom_field(workspace_gid, field_name)
+        client.attach_custom_field(project_id, field_gid)
+    return True
+
+
 def workspace_info(token, workspace_gid):
     return asana_client.AsanaClient(token, [], _logger).get_workspace_info(workspace_gid)
 

@@ -523,8 +523,19 @@ class OnboardingManager:
                 )
                 return
 
+            attached_fields = self.validators.ensure_database_project_ready(
+                data["asana_token"], data["workspace_gid"], project_id,
+            )
             data["existing_database_project_ids"].append(project_id)
-            self.gateway.send_message(chat_id, f"Found it: '{result}'.")
+            if attached_fields:
+                self.gateway.send_message(
+                    chat_id,
+                    f"Found it: '{result}' - it had no usable columns yet, so I added our "
+                    "standard set (Co-driver/Vehicle Id/Email/Phone Number/CDL/State/Login/"
+                    "Password) to it.",
+                )
+            else:
+                self.gateway.send_message(chat_id, f"Found it: '{result}'.")
 
         if len(data["existing_database_project_ids"]) < data["database_board_count"]:
             self._ask_next_database_link(chat_id, data)
