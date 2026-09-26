@@ -223,6 +223,7 @@ class OnboardingManager:
             )
             return
         self.gateway.send_message(chat_id, f"Factor ELD confirmed ({message}).")
+        self._warn_if_tenant_reused(chat_id, "factor_tenant_id", data["factor_tenant_id"], "Factor ELD")
         self._advance(chat_id, STATE_ASK_LEADER_TOKEN, data)
         self.gateway.send_message(chat_id, "Paste your Leader ELD session token (or /skip).")
 
@@ -246,8 +247,38 @@ class OnboardingManager:
             )
             return
         self.gateway.send_message(chat_id, f"Leader ELD confirmed ({message}).")
+        self._warn_if_tenant_reused(chat_id, "leader_tenant_id", data["leader_tenant_id"], "Leader ELD")
         self._advance(chat_id, STATE_ASK_ASANA_TOKEN, data)
         self.gateway.send_message(chat_id, "Now paste your Asana personal access token.")
+
+    def _warn_if_tenant_reused(self, chat_id, tenant_field, tenant_id, label):
+        """A token+tenant_id pair validating successfully only proves it's a
+        REAL account - it says nothing about whether it's THIS team's own
+        account. Confirmed live (2026-09-25/26, Central B and then ALGO D):
+        pasting another team's tenant_id by habit/mistake passes validation
+        every time and silently pulls that other team's companies onto the
+        new team's boards - the single most expensive mistake made across
+        this whole onboarding effort, each time only caught by manually
+        diffing live driver data well after boards were already created and
+        syncing. A same tenant_id can genuinely be intentional (a shared
+        ELD account), so this only warns - never blocks - but it surfaces
+        the risk at the exact moment it's still cheap to fix (before any
+        board exists yet), rather than hours later."""
+        if not tenant_id:
+            return
+        matches = [
+            t["team_name"] for t in self.config_store.list_teams()
+            if t.get(tenant_field) == tenant_id
+        ]
+        if matches:
+            self.gateway.send_message(
+                chat_id,
+                f"⚠️ Heads up: this exact {label} tenant_id is already used by "
+                f"{', '.join(matches)}. If that's not intentional (this should "
+                "be a DIFFERENT account for this team), send /cancel now and "
+                "restart with the correct one - continuing will very likely "
+                "mix that team's companies onto this one's boards.",
+            )
 
     def _handle_asana_token(self, chat_id, sender_id, data, text):
         text = _clean_pasted_value(text)
@@ -363,9 +394,10 @@ class OnboardingManager:
             self.gateway.send_message(
                 chat_id,
                 "Paste the link (or project ID) of an existing board - yours or "
-                "another team's - to use as a template. Your new board(s) will get "
-                "the exact same columns, as a fresh copy (editing one later never "
-                "affects the other).",
+                "another team's - to copy the company/driver list from. Your new "
+                "board(s) will use our standard columns (Status/Vehicle Number/"
+                "Staff ID) and start with that same list of companies - it's a "
+                "fresh copy, so editing one later never affects the other.",
             )
 
     def _handle_board_links(self, chat_id, sender_id, data, text):

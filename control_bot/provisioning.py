@@ -56,21 +56,34 @@ class Provisioner:
         # Two ways to get dispatch boards (see onboarding.py's
         # _handle_boards_exist): either the team already has them - use the
         # real project ids directly, exactly as given, never modified - or
-        # they don't, in which case fresh boards are created shaped like a
-        # template project the team picked (bootstrap_dispatch_project_from_
-        # template), auto-named team_name + A/B/C.../ team_name alone for
-        # just one. Either way, staff roster still needs pushing to every
-        # board's own Staff ID field (each board has its own separate
-        # field - see _populate_staff_roster's guard for when a board, e.g.
-        # an arbitrary existing one, doesn't have that field at all).
+        # they don't, in which case fresh boards are created with our own
+        # standard columns (bootstrap_dispatch_project - Status/Vehicle
+        # Number/Staff ID, the same shape every existing team's boards
+        # use), auto-named team_name + A/B/C.../ team_name alone for just
+        # one, then the company/driver section list is copied over from
+        # whichever board the team picked as a reference (copy_sections_from)
+        # so the new board starts with the same company list instead of
+        # empty. Confirmed the wrong way round the hard way (2026-09-26):
+        # earlier this copied the REFERENCE board's own field layout via
+        # bootstrap_dispatch_project_from_template instead - fine for a
+        # clean template, but disastrous for a team whose "reference" was
+        # actually their own real, manually-maintained board (rich ad-hoc
+        # columns, no section copy at all), which is exactly what a team
+        # is most likely to paste here. Either way, staff roster still
+        # needs pushing to every board's own Staff ID field (each board has
+        # its own separate field - see _populate_staff_roster's guard for
+        # when a board, e.g. an arbitrary existing one, doesn't have that
+        # field at all).
         if data.get("dispatch_boards_exist"):
             dispatch_project_ids = list(data["existing_dispatch_project_ids"])
         else:
             template_id = data["template_dispatch_project_id"]
             dispatch_project_ids = [
-                client.bootstrap_dispatch_project_from_template(workspace_gid, board_name, template_id, team_gid)
+                client.bootstrap_dispatch_project(workspace_gid, board_name, team_gid)
                 for board_name in data["dispatch_board_names"]
             ]
+            for project_id in dispatch_project_ids:
+                client.copy_sections_from(template_id, project_id)
         for project_id in dispatch_project_ids:
             self._populate_staff_roster(client, project_id, data.get("staff_roster") or {})
 

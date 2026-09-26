@@ -999,8 +999,25 @@ class TeamRouter:
         self.config_store.update_team(team_id, **{field_name: data["pending_token"], tenant_field: new_tenant_id})
         self.config_store.clear_onboarding_session(chat_id)
         self.provisioning.rewrite_env(team_id)
+
+        # Same reused-tenant risk onboarding.py warns about, here too - a
+        # rotation is exactly how last time's wrong-tenant mistakes got
+        # fixed, so it's just as easy to introduce a new one this way.
+        other_matches = [
+            t["team_name"] for t in self.config_store.list_teams()
+            if t["team_id"] != team_id and t.get(tenant_field) == new_tenant_id
+        ]
+        warning = ""
+        if other_matches:
+            warning = (
+                f"\n\n⚠️ Heads up: this exact tenant_id is also used by "
+                f"{', '.join(other_matches)}. If that's not intentional, rotate it "
+                "again with the correct one - this will otherwise mix that team's "
+                "companies onto this one's boards."
+            )
         self.gateway.send_buttons(
             chat_id,
-            f"{data['label']} token + tenant_id updated ({message}) - takes effect on the next sync cycle.",
+            f"{data['label']} token + tenant_id updated ({message}) - takes effect on the next sync cycle."
+            + warning,
             [BACK_BUTTON],
         )
